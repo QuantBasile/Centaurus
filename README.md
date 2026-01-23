@@ -1,2 +1,0 @@
-# Centaurus
-PnL
