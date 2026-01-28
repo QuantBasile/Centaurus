@@ -742,7 +742,7 @@ class ReportDataTable(ttk.Frame):
 
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="w", stretch=True)
+            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
 
         rank_type_idx = cols.index("rank_type") if "rank_type" in cols else None
         rank_idx = cols.index("rank") if "rank" in cols else None

@@ -287,7 +287,7 @@ class InstDayDataSubsheet(ttk.Frame):
         self.tree["columns"] = cols
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="w", stretch=True)
+            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
 
         cache = self._cache
         for i in range(self._cache_len):
@@ -295,7 +295,7 @@ class InstDayDataSubsheet(ttk.Frame):
             tag = "even" if (i % 2 == 0) else "odd"
             self.tree.insert("", "end", values=values, tags=(tag,))
 
-        self._autofit_from_cache(sample_rows=min(200, self._cache_len))
+        self._autofit_from_cache(sample_rows=100)
 
     def _sort_by(self, col: str) -> None:
         df = self._df_view
@@ -330,50 +330,35 @@ class InstDayDataSubsheet(ttk.Frame):
             self.after_cancel(self._resize_after_id)
         self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
 
-    def _autofit_from_cache(self, sample_rows: int = 140) -> None:
+    def _autofit_from_cache(self, sample_rows: int = 500) -> None:
         if not self._rendered_cols or self._cache_len == 0:
             return
-
+    
         import tkinter.font as tkfont
-
         body_font = tkfont.nametofont("TkDefaultFont")
         heading_font = tkfont.Font(
             family=body_font.actual("family"),
             size=body_font.actual("size"),
             weight="bold",
         )
-
-        try:
-            available = max(500, self.tree.winfo_width() - 20)
-        except Exception:
-            available = 900
-
+    
         pad = 34
         n = min(sample_rows, self._cache_len)
         cache = self._cache
-
-        max_px: Dict[str, int] = {}
+    
+        widths = {}
         for c in self._rendered_cols:
-            max_px[c] = heading_font.measure(c) + pad
-
-        for c in self._rendered_cols:
+            w = heading_font.measure(c) + pad
             col_vals = cache.get(c, [])
             for i in range(n):
-                w = body_font.measure(col_vals[i]) + pad
-                if w > max_px[c]:
-                    max_px[c] = w
-
-        hard_min, hard_max = 80, 520
-        widths = {c: max(hard_min, min(hard_max, max_px[c])) for c in self._rendered_cols}
-
-        total = sum(widths.values())
-        if total > available * 1.2:
-            for c in self._rendered_cols:
-                if c.startswith("flag_"):
-                    widths[c] = max(hard_min, min(widths[c], 80))
-
+                ww = body_font.measure(col_vals[i]) + pad
+                if ww > w:
+                    w = ww
+            widths[c] = w
+    
         for c in self._rendered_cols:
-            self.tree.column(c, width=widths[c], stretch=True)
+            self.tree.column(c, width=widths[c], stretch=False)
+
 
     def _open_columns_dialog_fast(self) -> None:
         df = self._df_view
@@ -912,74 +897,83 @@ class InstDayPlotSubsheet(ttk.Frame):
         c = self.canvas_main
         w = max(520, c.winfo_width())
         h = max(280, c.winfo_height())
-
+    
         left, right, top, bottom = 70, 70, 30, 50
         x0, y0 = left, top
         x1, y1 = w - right, h - bottom
-
+    
         start_dt, end_dt = self._get_window(day)
         total_sec = (end_dt - start_dt).total_seconds()
         if total_sec <= 0:
             self._draw_empty(c, "Bad zoom window.")
             return []
-
+    
         t = df["tradeTime"]
         mask = (t >= start_dt) & (t <= end_dt)
+    
         needed = ["tradeTime"] + list(set(pnl_cols + delta_cols))
         sub = df.loc[mask, [col for col in needed if col in df.columns]].copy()
         if sub.empty:
             self._draw_empty(c, "No trades in window.")
             return []
-
+    
         sub.sort_values("tradeTime", inplace=True, kind="mergesort")
         secs = (sub["tradeTime"] - start_dt).dt.total_seconds().astype("float64")
-
-        def series_range(cols: List[str]) -> Optional[Tuple[float, float]]:
+    
+        # ---------- symmetric ranges around 0 ----------
+        def max_abs_for(cols: List[str]) -> float:
             if not cols:
-                return None
+                return 1.0
             vals = []
             for col in cols:
                 if col in sub.columns:
-                    vals.append(pd.to_numeric(sub[col], errors="coerce").astype("float64"))
+                    s = pd.to_numeric(sub[col], errors="coerce").astype("float64")
+                    vals.append(s)
             if not vals:
-                return None
+                return 1.0
             s_all = pd.concat(vals, axis=0).dropna()
             if s_all.empty:
-                return None
-            return float(s_all.min()), float(s_all.max())
-
-        def pad_range(r: Tuple[float, float]) -> Tuple[float, float]:
-            a, b = r
-            if a == b:
-                return a - 1.0, b + 1.0
-            span = b - a
-            return a - 0.08 * span, b + 0.08 * span
-
-        pnl_rng = series_range(pnl_cols) or (-1.0, 1.0)
-        d_rng = series_range(delta_cols) or (-1.0, 1.0)
-        pnl_min, pnl_max = pad_range(pnl_rng)
-        d_min, d_max = pad_range(d_rng)
-
+                return 1.0
+            m = float(s_all.abs().max())
+            if not (m > 0):
+                m = 1.0
+            # small padding so lines don't touch frame
+            return m * 1.08
+    
+        pnl_maxabs = max_abs_for(pnl_cols)
+        d_maxabs = max_abs_for(delta_cols)
+    
+        pnl_min, pnl_max = -pnl_maxabs, +pnl_maxabs
+        d_min, d_max = -d_maxabs, +d_maxabs
+    
         def x_map(s: float) -> float:
             return x0 + (s / total_sec) * (x1 - x0)
-
+    
         def y_map_left(v: float) -> float:
+            # pnl range is symmetric around 0
             return y1 - ((v - pnl_min) / (pnl_max - pnl_min)) * (y1 - y0)
-
+    
         def y_map_right(v: float) -> float:
+            # delta range is symmetric around 0
             return y1 - ((v - d_min) / (d_max - d_min)) * (y1 - y0)
-
+    
+        # Frame
         c.create_rectangle(x0, y0, x1, y1, outline="#D8E1F0", width=1)
-
-        # grid: 10 vertical + 5 horizontal
+    
+        # Grid: 10 vertical, 4 horizontal (plus strong 0-line)
         for i in range(11):
             xx = x0 + i * (x1 - x0) / 10
             c.create_line(xx, y0, xx, y1, fill="#EEF3FF")
+    
         for i in range(5):
             yy = y0 + i * (y1 - y0) / 4
             c.create_line(x0, yy, x1, yy, fill="#F3F6FF")
-
-        # axes labels
+    
+        # Strong horizontal line at y=0 (center)
+        y_zero = y_map_left(0.0)  # == y_map_right(0.0) due to symmetry
+        c.create_line(x0, y_zero, x1, y_zero, fill="#B8C7E6", width=2)
+    
+        # Axes labels (left: PnL, right: Delta) — symmetric ticks
         for i in range(5):
             frac = i / 4
             yy = y1 - frac * (y1 - y0)
@@ -987,19 +981,20 @@ class InstDayPlotSubsheet(ttk.Frame):
             vR = d_min + frac * (d_max - d_min)
             c.create_text(x0 - 8, yy, text=f"{vL:,.0f}", anchor="e", fill="#5E6B85", font=("Segoe UI", 9))
             c.create_text(x1 + 8, yy, text=f"{vR:,.2f}", anchor="w", fill="#5E6B85", font=("Segoe UI", 9))
-
+    
         # markers (relative to full day, show if within zoom)
         full_start = pd.Timestamp(datetime.combine(day, time(8, 0, 0)))
         full_end = pd.Timestamp(datetime.combine(day, time(22, 0, 0)))
         self._draw_marker_windowed(c, day, full_start, full_end, start_dt, end_dt, total_sec, x_map, y0, y1)
-
-        # titles: left + right on top of corresponding axes
+    
+        # titles
         c.create_text(x0, y0 - 14, text="PnL", anchor="w", fill="#0B1220", font=("Segoe UI Semibold", 10))
         c.create_text(x1, y0 - 14, text="Δ (right)", anchor="e", fill="#0B1220", font=("Segoe UI Semibold", 10))
-
+    
         palette = ["#2E7BFF", "#00B6D6", "#7C3AED", "#16A34A", "#F97316", "#EF4444", "#0EA5E9", "#A855F7"]
         legend_items: List[Tuple[str, str, str]] = []
-
+    
+        # PnL lines (left axis)
         for k, colname in enumerate(pnl_cols):
             if colname not in sub.columns:
                 continue
@@ -1011,7 +1006,8 @@ class InstDayPlotSubsheet(ttk.Frame):
             if len(pts) >= 4:
                 c.create_line(*pts, fill=color, width=2)
                 legend_items.append((color, colname, "PnL"))
-
+    
+        # Delta lines (right axis)
         offset = len(pnl_cols)
         for k, colname in enumerate(delta_cols):
             if colname not in sub.columns:
@@ -1024,8 +1020,9 @@ class InstDayPlotSubsheet(ttk.Frame):
             if len(pts) >= 4:
                 c.create_line(*pts, fill=color, width=2)
                 legend_items.append((color, colname, "Δ"))
-
+    
         return legend_items
+
 
     def _draw_marker_windowed(
         self,

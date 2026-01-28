@@ -181,7 +181,7 @@ class EODDataSubsheet(ttk.Frame):
         self.tree["columns"] = cols
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="w", stretch=True)
+            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
 
         cache = self._cache
         for i in range(self._cache_len):
@@ -230,38 +230,34 @@ class EODDataSubsheet(ttk.Frame):
                 pass
         self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
 
-    def _autofit_from_cache(self, sample_rows: int = 140) -> None:
+    def _autofit_from_cache(self, sample_rows: int = 500) -> None:
         if not self._rendered_cols or self._cache_len == 0:
             return
-
+    
         import tkinter.font as tkfont
-
         body_font = tkfont.nametofont("TkDefaultFont")
         heading_font = tkfont.Font(
             family=body_font.actual("family"),
             size=body_font.actual("size"),
             weight="bold",
         )
-
+    
         pad = 34
         n = min(sample_rows, self._cache_len)
         cache = self._cache
-
-        max_px: Dict[str, int] = {}
+    
+        widths = {}
         for c in self._rendered_cols:
-            max_px[c] = heading_font.measure(c) + pad
-
-        for c in self._rendered_cols:
+            w = heading_font.measure(c) + pad
             col_vals = cache.get(c, [])
             for i in range(n):
-                w = body_font.measure(col_vals[i]) + pad
-                if w > max_px[c]:
-                    max_px[c] = w
-
-        hard_min, hard_max = 80, 520
-        widths = {c: max(hard_min, min(hard_max, max_px[c])) for c in self._rendered_cols}
+                ww = body_font.measure(col_vals[i]) + pad
+                if ww > w:
+                    w = ww
+            widths[c] = w
+    
         for c in self._rendered_cols:
-            self.tree.column(c, width=widths[c], stretch=True)
+            self.tree.column(c, width=widths[c], stretch=False)
 
     def _open_columns_dialog_fast(self) -> None:
         df = self._df
