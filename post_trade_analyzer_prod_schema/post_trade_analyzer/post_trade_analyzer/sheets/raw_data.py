@@ -105,7 +105,8 @@ class RawDataSheet(BaseSheet):
             tag = "even" if (i % 2 == 0) else "odd"
             self.tree.insert("", "end", values=values, tags=(tag,))
 
-        self._autofit_from_cache(sample_rows=min(150, n_show))
+        self._autofit_from_cache(sample_rows=None)  # measure all cached rows
+
 
     def _clear_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -116,49 +117,46 @@ class RawDataSheet(BaseSheet):
             self.after_cancel(self._resize_after_id)
         self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=120))
 
-    def _autofit_from_cache(self, sample_rows: int = 120) -> None:
+    def _autofit_from_cache(self, sample_rows: int | None = None) -> None:
+        """
+        True autofit: width = max(header, max(cell)) + padding.
+        No hard min/max. No truncation by design.
+        """
         if not self._rendered_cols or self._cache_len == 0:
             return
-
+    
         import tkinter.font as tkfont
+    
         body_font = tkfont.nametofont("TkDefaultFont")
         heading_font = tkfont.Font(
             family=body_font.actual("family"),
             size=body_font.actual("size"),
             weight="bold",
         )
-
-        try:
-            available = max(500, self.tree.winfo_width() - 20)
-        except Exception:
-            available = 900
-
-        pad = 24
-        n = min(sample_rows, self._cache_len)
+    
+        pad = 34
+    
+        # If you show only first 500 rows, sample_rows can be None => measure all cached rows.
+        n = self._cache_len if sample_rows is None else min(sample_rows, self._cache_len)
         cache = self._cache
-
-        max_px: Dict[str, int] = {}
+    
+        widths = {}
         for c in self._rendered_cols:
-            max_px[c] = heading_font.measure(c) + pad
-
-        for c in self._rendered_cols:
+            # start with header width
+            w = heading_font.measure(c) + pad
+    
+            # measure cell strings (already formatted in cache)
             col_vals = cache.get(c, [])
             for i in range(n):
-                w = body_font.measure(col_vals[i]) + pad
-                if w > max_px[c]:
-                    max_px[c] = w
-
-        hard_min, hard_max = 70, 360
-        widths = {c: max(hard_min, min(hard_max, max_px[c])) for c in self._rendered_cols}
-
-        total = sum(widths.values())
-        if total > available * 1.2:
-            for c in self._rendered_cols:
-                if c.startswith("flag_"):
-                    widths[c] = max(hard_min, min(widths[c], 70))
-
+                ww = body_font.measure(col_vals[i]) + pad
+                if ww > w:
+                    w = ww
+    
+            widths[c] = w
+    
         for c in self._rendered_cols:
-            self.tree.column(c, width=widths[c], stretch=True)
+            self.tree.column(c, width=widths[c], stretch=False)
+
 
     def _open_columns_dialog_fast(self) -> None:
         df = self._df
