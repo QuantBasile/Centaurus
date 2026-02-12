@@ -203,7 +203,7 @@ class InstDayDataSubsheet(ttk.Frame):
         self.tree.tag_configure("odd", background="#FFFFFF")
         self.tree.tag_configure("even", background="#F8FAFF")
 
-        self.tree.bind("<Configure>", self._on_tree_configure)
+        #self.tree.bind("<Configure>", self._on_tree_configure)
 
     def set_df(self, df: Optional[pd.DataFrame]) -> None:
         self._df_base = df
@@ -325,10 +325,10 @@ class InstDayDataSubsheet(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = []
 
-    def _on_tree_configure(self, _event) -> None:
-        if self._resize_after_id is not None:
-            self.after_cancel(self._resize_after_id)
-        self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
+    #def _on_tree_configure(self, _event) -> None:
+    #    if self._resize_after_id is not None:
+    #        self.after_cancel(self._resize_after_id)
+    #    self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
 
     def _autofit_from_cache(self, sample_rows: int = 500) -> None:
         if not self._rendered_cols or self._cache_len == 0:
@@ -573,9 +573,9 @@ class InstDayPlotSubsheet(ttk.Frame):
         self.canvas_main.pack(fill="both", expand=True)
 
         # debounced redraw on resize
-        self.canvas_spot.bind("<Configure>", lambda e: self._schedule_redraw(120))
-        self.canvas_main.bind("<Configure>", lambda e: self._schedule_redraw(120))
-        self.legend.bind("<Configure>", lambda e: self._schedule_redraw(160))
+        self.canvas_spot.bind("<Configure>", lambda e: self._schedule_redraw(220))
+        self.canvas_main.bind("<Configure>", lambda e: self._schedule_redraw(220))
+        self.legend.bind("<Configure>", lambda e: self._schedule_redraw(250))
 
         # simple zoom: drag on main plot only
         self.canvas_main.bind("<ButtonPress-1>", self._zoom_drag_start)
