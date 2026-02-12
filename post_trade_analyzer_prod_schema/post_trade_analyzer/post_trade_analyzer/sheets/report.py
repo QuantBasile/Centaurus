@@ -15,13 +15,14 @@ from ..utils.time_utils import parse_iso_date
 
 
 # ------------------------------------------------------------
-# Report Sheet
+# Report Sheet (CEO Mode + Deluxe TOTAL row + selectable PnL extras)
 # ------------------------------------------------------------
 
 class ReportSheet(ttk.Frame):
     sheet_id = "report"
     sheet_title = "Report"
 
+    # main metric dropdown candidates
     DEFAULT_METRICS = [
         "Total",
         "PremiaCum",
@@ -43,6 +44,17 @@ class ReportSheet(ttk.Frame):
         "tradeTime",
     ]
 
+    # defaults shown in PnL extras selector
+    DEFAULT_EXTRA_TOTAL_METRICS = [
+        "Total",
+        "AufgeldCum",
+        "feesCum",
+        "PremiaCum",
+        "PnlVonDeltaCum",
+        "SpreadsCapture",
+        "FullSpreadCapture",
+    ]
+
     PRESETS_DIR = "presets"  # relative to cwd
 
     def __init__(self, master: tk.Misc) -> None:
@@ -55,13 +67,16 @@ class ReportSheet(ttk.Frame):
 
         self.from_var = tk.StringVar()
         self.to_var = tk.StringVar()
-        self.n_var = tk.IntVar(value=5)
+        self.n_var = tk.IntVar(value=10)
 
-        self.mode_var = tk.StringVar(value="Value")  # "Value" | "Abs(Value)"
-        self.include_top_var = tk.BooleanVar(value=True)
-        self.include_bottom_var = tk.BooleanVar(value=True)
+        self.metric_var = tk.StringVar(value="Total")
+        self.portfolio_var = tk.StringVar(value="ALL")
 
         self._build()
+
+    # ----------------------------
+    # UI
+    # ----------------------------
 
     def _build(self) -> None:
         # Title
@@ -76,7 +91,7 @@ class ReportSheet(ttk.Frame):
         inner = ttk.Frame(card, style="Card.TFrame")
         inner.pack(fill="x", padx=12, pady=12)
 
-        # Row 0 - dates, N, ranking
+        # Row 0 - dates, N, metric, portfolio
         r0 = ttk.Frame(inner)
         r0.pack(fill="x")
 
@@ -88,50 +103,50 @@ class ReportSheet(ttk.Frame):
         self.to_entry = ttk.Entry(r0, textvariable=self.to_var, width=12)
         self.to_entry.pack(side="left", padx=(8, 14))
 
-        ttk.Label(r0, text="N", style="Muted.TLabel").pack(side="left")
+        ttk.Label(r0, text="N (Top/Bottom)", style="Muted.TLabel").pack(side="left")
         self.n_spin = ttk.Spinbox(r0, from_=1, to=50000, textvariable=self.n_var, width=7)
         self.n_spin.pack(side="left", padx=(8, 14))
 
-        ttk.Label(r0, text="Ranking", style="Muted.TLabel").pack(side="left")
-        self.mode_cb = ttk.Combobox(r0, textvariable=self.mode_var, state="readonly", width=12)
-        self.mode_cb["values"] = ["Value", "Abs(Value)"]
-        self.mode_cb.pack(side="left", padx=(8, 14))
+        ttk.Label(r0, text="Metric", style="Muted.TLabel").pack(side="left")
+        self.metric_cb = ttk.Combobox(r0, textvariable=self.metric_var, state="readonly", width=22)
+        self.metric_cb.pack(side="left", padx=(8, 14))
 
-        ttk.Checkbutton(r0, text="Top", variable=self.include_top_var).pack(side="left")
-        ttk.Checkbutton(r0, text="Bottom", variable=self.include_bottom_var).pack(side="left", padx=(8, 0))
+        ttk.Label(r0, text="Portfolio", style="Muted.TLabel").pack(side="left")
+        self.portfolio_cb = ttk.Combobox(r0, textvariable=self.portfolio_var, state="readonly", width=18)
+        self.portfolio_cb.pack(side="left", padx=(8, 14))
 
         self.apply_btn = ttk.Button(r0, text="Apply", style="Accent.TButton", command=self._apply_report)
         self.apply_btn.pack(side="right")
 
-        # Row 1 - selectors (metrics + fields)
+        # Row 1 - Fields + PnL extras multi-select
         r1 = ttk.Frame(inner)
         r1.pack(fill="x", pady=(12, 0))
 
-        mbox = ttk.Frame(r1, style="Card.TFrame")
-        mbox.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ttk.Label(mbox, text="Metrics (multi-select)", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
-        self.metrics_lb = tk.Listbox(
-            mbox, selectmode="extended", activestyle="none", exportselection=False, height=7
-        )
-        self.metrics_lb.pack(fill="x", expand=True)
-
         fbox = ttk.Frame(r1, style="Card.TFrame")
-        fbox.pack(side="left", fill="x", expand=True)
+        fbox.pack(side="left", fill="x", expand=True, padx=(0, 10))
         ttk.Label(fbox, text="Fields to show (multi-select)", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
         self.fields_lb = tk.Listbox(
             fbox, selectmode="extended", activestyle="none", exportselection=False, height=7
         )
         self.fields_lb.pack(fill="x", expand=True)
 
+        pbox = ttk.Frame(r1, style="Card.TFrame")
+        pbox.pack(side="left", fill="x", expand=True)
+        ttk.Label(pbox, text="PnL columns to display (TOTAL row)", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        self.pnl_lb = tk.Listbox(
+            pbox, selectmode="extended", activestyle="none", exportselection=False, height=7
+        )
+        self.pnl_lb.pack(fill="x", expand=True)
+
         # Row 2 - buttons
         r2 = ttk.Frame(inner)
         r2.pack(fill="x", pady=(12, 0))
 
-        ttk.Button(r2, text="Metrics: all", command=lambda: self._lb_select_all(self.metrics_lb)).pack(side="left")
-        ttk.Button(r2, text="Metrics: none", command=lambda: self._lb_select_none(self.metrics_lb)).pack(side="left", padx=6)
-
-        ttk.Button(r2, text="Fields: all", command=lambda: self._lb_select_all(self.fields_lb)).pack(side="left", padx=(14, 0))
+        ttk.Button(r2, text="Fields: all", command=lambda: self._lb_select_all(self.fields_lb)).pack(side="left")
         ttk.Button(r2, text="Fields: none", command=lambda: self._lb_select_none(self.fields_lb)).pack(side="left", padx=6)
+
+        ttk.Button(r2, text="PnL: all", command=lambda: self._lb_select_all(self.pnl_lb)).pack(side="left", padx=(14, 0))
+        ttk.Button(r2, text="PnL: none", command=lambda: self._lb_select_none(self.pnl_lb)).pack(side="left", padx=6)
 
         ttk.Button(r2, text="Save preset", command=self._save_preset).pack(side="left", padx=(14, 0))
         ttk.Button(r2, text="Load preset", command=self._load_preset).pack(side="left", padx=6)
@@ -143,7 +158,8 @@ class ReportSheet(ttk.Frame):
         self.info_var = tk.StringVar(value="Load data to begin.")
         ttk.Label(inner, textvariable=self.info_var, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
 
-        self.summary_text = tk.Text(inner, height=3, wrap="word", relief="flat", bg="#FFFFFF")
+        # keep summary short (CEO)
+        self.summary_text = tk.Text(inner, height=2, wrap="word", relief="flat", bg="#FFFFFF")
         self.summary_text.pack(fill="x", pady=(8, 0))
         self.summary_text.configure(state="disabled")
 
@@ -154,6 +170,8 @@ class ReportSheet(ttk.Frame):
         # Key binds
         self.from_entry.bind("<Return>", lambda e: self._apply_report())
         self.to_entry.bind("<Return>", lambda e: self._apply_report())
+        self.metric_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_report())
+        self.portfolio_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_report())
 
     @staticmethod
     def _lb_select_all(lb: tk.Listbox) -> None:
@@ -167,7 +185,7 @@ class ReportSheet(ttk.Frame):
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", "end")
         if lines:
-            self.summary_text.insert("1.0", "\n".join(lines[:3]))
+            self.summary_text.insert("1.0", "\n".join(lines[:2]))
         self.summary_text.configure(state="disabled")
 
     # ----------------------------
@@ -184,7 +202,6 @@ class ReportSheet(ttk.Frame):
             self.data.set_df(None)
             return
 
-        # default dates
         dmin = self._df_eod["day"].min()
         dmax = self._df_eod["day"].max()
         if isinstance(dmin, date) and not self.from_var.get():
@@ -192,8 +209,6 @@ class ReportSheet(ttk.Frame):
         if isinstance(dmax, date) and not self.to_var.get():
             self.to_var.set(dmax.isoformat())
 
-        # metrics list
-        self.metrics_lb.delete(0, "end")
         existing = set(self._df_eod.columns)
 
         metric_cols = [c for c in self.DEFAULT_METRICS if c in existing]
@@ -201,38 +216,57 @@ class ReportSheet(ttk.Frame):
             metric_cols = [
                 c for c in self._df_eod.columns
                 if pd.api.types.is_numeric_dtype(self._df_eod[c]) and c not in ("tradeNr",)
-            ][:16]
+            ][:24]
+        self.metric_cb["values"] = metric_cols
+        if self.metric_var.get() not in metric_cols:
+            self.metric_var.set(metric_cols[0] if metric_cols else "")
 
-        for c in metric_cols:
-            self.metrics_lb.insert("end", c)
+        portfolios = ["ALL"]
+        if "portfolio" in self._df_eod.columns:
+            vals = (
+                self._df_eod["portfolio"]
+                .astype("string")
+                .fillna("")
+                .replace({"<NA>": ""})
+                .unique()
+                .tolist()
+            )
+            vals = [v for v in vals if v and v.strip()]
+            portfolios += sorted(set(vals))
+        self.portfolio_cb["values"] = portfolios
+        if self.portfolio_var.get() not in portfolios:
+            self.portfolio_var.set("ALL")
 
-        if metric_cols:
-            try:
-                idx = metric_cols.index("Total")
-            except ValueError:
-                idx = 0
-            self.metrics_lb.selection_set(idx)
-
-        # fields list
         self.fields_lb.delete(0, "end")
-        fields = []
+        fields: List[str] = []
         for c in self.DEFAULT_FIELDS:
             if c in existing and c not in fields:
                 fields.append(c)
-
         for c in self._df_eod.columns:
             if c in fields or c in metric_cols or c.startswith("flag_"):
                 continue
             fields.append(c)
-            if len(fields) >= 24:
+            if len(fields) >= 30:
                 break
-
         for c in fields:
             self.fields_lb.insert("end", c)
 
         for i, c in enumerate(fields):
             if c in ("instrument", "day", "portfolio", "counterparty", "underlying"):
                 self.fields_lb.selection_set(i)
+
+        self.pnl_lb.delete(0, "end")
+        pnl_candidates = [c for c in self.DEFAULT_EXTRA_TOTAL_METRICS if c in existing]
+        if not pnl_candidates:
+            pnl_candidates = [
+                c for c in self._df_eod.columns
+                if pd.api.types.is_numeric_dtype(self._df_eod[c]) and c not in ("tradeNr",)
+            ][:24]
+        for c in pnl_candidates:
+            self.pnl_lb.insert("end", c)
+
+        if pnl_candidates:
+            self.pnl_lb.selection_set(0, "end")
 
         self._apply_report()
 
@@ -242,7 +276,6 @@ class ReportSheet(ttk.Frame):
             return None
         if "instrument" not in df.columns or "tradeTime" not in df.columns:
             return None
-
         tmp = df.copy()
         tmp["_day"] = tmp["tradeTime"].dt.date
         tmp.sort_values(["instrument", "_day", "tradeTime"], inplace=True, kind="mergesort")
@@ -268,6 +301,7 @@ class ReportSheet(ttk.Frame):
         except ValueError:
             self.info_var.set("Invalid date. Use YYYY-MM-DD.")
             self._set_summary([])
+            self.data.set_df(None)
             return
 
         if d_to < d_from:
@@ -278,176 +312,206 @@ class ReportSheet(ttk.Frame):
         n = int(self.n_var.get())
         n = max(1, min(50000, n))
 
-        metric_cols = self._selected_from_listbox(self.metrics_lb)
-        field_cols = self._selected_from_listbox(self.fields_lb)
-
-        if not metric_cols:
-            self.info_var.set("Select at least 1 metric.")
+        metric = (self.metric_var.get() or "").strip()
+        if not metric or metric not in self._df_eod.columns:
+            self.info_var.set("Select a valid metric.")
             self._set_summary([])
+            self.data.set_df(None)
             return
 
-        if not (self.include_top_var.get() or self.include_bottom_var.get()):
-            self.info_var.set("Select Top and/or Bottom.")
-            self._set_summary([])
-            return
+        fields = self._selected_from_listbox(self.fields_lb)
+        pnl_extras = self._selected_from_listbox(self.pnl_lb)
 
         base = self._df_eod
         mask = (base["day"] >= d_from) & (base["day"] <= d_to)
         rng = base.loc[mask].copy()
+
+        pf = (self.portfolio_var.get() or "ALL").strip()
+        if pf != "ALL" and "portfolio" in rng.columns:
+            rng = rng[rng["portfolio"].astype("string") == pf]
+
         self._df_range = rng
 
-        report = self._build_report_table(
-            rng,
-            metric_cols,
-            field_cols,
-            n,
-            self.mode_var.get(),
-            include_top=self.include_top_var.get(),
-            include_bottom=self.include_bottom_var.get(),
+        report, kpis = self._build_report_table_ceo_deluxe(
+            rng=rng,
+            metric=metric,
+            fields=fields,
+            n=n,
+            extra_metrics=pnl_extras,
         )
 
         self._df_report = report
         self.data.set_df(report)
 
-        self.info_var.set(
-            f"EOD rows: {len(rng):,} • Metrics: {len(metric_cols)} • N={n} • Mode={self.mode_var.get()} • "
-            f"Top={self.include_top_var.get()} Bottom={self.include_bottom_var.get()}"
-        )
+        # CEO KPIs
+        kpi_txt = ""
+        if kpis:
+            kpi_txt = f"TOTAL Σ={kpis['total_sum']:,} • TOP Σ={kpis['top_sum']:,} • BOTTOM Σ={kpis['bottom_sum']:,} • NET={kpis['net']:,}"
 
-        self._set_summary(self._make_summary_lines(rng, metric_cols))
+        # Best/Worst badges (confirmed)
+        best_txt = ""
+        worst_txt = ""
+        if rng is not None and not rng.empty and metric in rng.columns:
+            s = pd.to_numeric(rng[metric], errors="coerce").fillna(0.0)
+            try:
+                i_best = int(s.idxmax())
+                i_worst = int(s.idxmin())
+
+                rb = rng.loc[i_best]
+                rw = rng.loc[i_worst]
+
+                best_txt = f"BEST: {rb.get('instrument','?')} {rb.get('day','?')} = {int(round(float(s.loc[i_best]))):,}"
+                worst_txt = f"WORST: {rw.get('instrument','?')} {rw.get('day','?')} = {int(round(float(s.loc[i_worst]))):,}"
+            except Exception:
+                best_txt = ""
+                worst_txt = ""
+
+        msg = f"EOD rows: {len(rng):,} • Metric: {metric} • N={n} • Portfolio={pf}"
+        if kpi_txt:
+            msg += f" • {kpi_txt}"
+        if best_txt:
+            msg += f" • {best_txt}"
+        if worst_txt:
+            msg += f" • {worst_txt}"
+
+        self.info_var.set(msg)
+        self._set_summary(self._make_summary_lines(rng))
 
     @staticmethod
     def _selected_from_listbox(lb: tk.Listbox) -> List[str]:
         return [lb.get(i) for i in lb.curselection()]
 
     @staticmethod
-    def _make_summary_lines(rng: pd.DataFrame, metrics: List[str]) -> List[str]:
+    def _make_summary_lines(rng: pd.DataFrame) -> List[str]:
         if rng is None or rng.empty:
-            return ["No rows in range."]
-
+            return ["No rows in range (after portfolio filter)."]
         inst_n = rng["instrument"].nunique() if "instrument" in rng.columns else len(rng)
         day_n = rng["day"].nunique() if "day" in rng.columns else len(rng)
-        lines = [f"Universe: instruments={inst_n:,} • days={day_n:,} • rows={len(rng):,}"]
-
-        for m in metrics[:3]:
-            if m not in rng.columns:
-                continue
-            s = pd.to_numeric(rng[m], errors="coerce").fillna(0.0)
-            lines.append(
-                f"{m}: Σ={s.sum():,.0f} | μ={s.mean():,.0f} | min={s.min():,.0f} | max={s.max():,.0f} | "
-                f"+{int((s>0).sum())}/-{int((s<0).sum())}"
-            )
-        if len(metrics) > 3:
-            lines.append("… (summary shows first 3 metrics)")
-        return lines
-
-    # ----------------------------
-    # Report table build (with TOTAL rows)
-    # ----------------------------
+        return [f"Universe: instruments={inst_n:,} • days={day_n:,} • rows={len(rng):,}"]
 
     @staticmethod
-    def _build_report_table(
-        df_eod: pd.DataFrame,
-        metrics: List[str],
+    def _fmt_int_series(x: pd.Series) -> pd.Series:
+        v = pd.to_numeric(x, errors="coerce").round(0)
+        return v.astype("Int64")
+
+    @classmethod
+    def _build_report_table_ceo_deluxe(
+        cls,
+        rng: pd.DataFrame,
+        metric: str,
         fields: List[str],
         n: int,
-        mode: str,
-        include_top: bool,
-        include_bottom: bool,
-    ) -> pd.DataFrame:
-        if df_eod is None or df_eod.empty:
-            return pd.DataFrame()
+        extra_metrics: List[str],
+    ) -> tuple[pd.DataFrame, Dict[str, int]]:
+        if rng is None or rng.empty:
+            return pd.DataFrame(), {}
 
-        fields = [c for c in fields if c in df_eod.columns]
+        fields = [c for c in fields if c in rng.columns]
         for must in ("instrument", "day"):
-            if must in df_eod.columns and must not in fields:
+            if must in rng.columns and must not in fields:
                 fields.insert(0, must)
 
-        def add_total_row(block: pd.DataFrame, metric_name: str, rank_type: str) -> pd.DataFrame:
-            total = float(pd.to_numeric(block["_metric_value"], errors="coerce").fillna(0.0).sum())
+        work = rng.copy()
+        work["_metric_value"] = pd.to_numeric(work[metric], errors="coerce").fillna(0.0)
 
-            # IMPORTANT: use pd.NA (NOT "") to avoid table_utils int('') crashes
-            row = {c: pd.NA for c in block.columns}
-            row["_metric_value"] = total
-            row["metric"] = metric_name
-            row["rank_type"] = rank_type
-            row["rank"] = "TOTAL"
-            return pd.concat([block, pd.DataFrame([row])], ignore_index=True)
+        top = work.nlargest(n, "_metric_value").copy()
+        top["section"] = "Top"
+        top["rank"] = range(1, len(top) + 1)
 
-        rows: List[pd.DataFrame] = []
-        for m in metrics:
-            if m not in df_eod.columns:
-                continue
+        # Bottom ranks: rank=1 is most negative, but displayed with rank=1 at the end
+        bot_raw = work.nsmallest(n, "_metric_value").copy()
+        bot_raw["section"] = "Bottom"
+        bot_raw["rank"] = range(1, len(bot_raw) + 1)
+        bot = bot_raw.sort_values("rank", ascending=False, kind="mergesort").copy()
 
-            s = pd.to_numeric(df_eod[m], errors="coerce").fillna(0.0)
-            work = df_eod.copy()
-            work["_metric_value"] = s
+        # extras for TOTAL row
+        extra_cols = [c for c in extra_metrics if c in work.columns and c != metric]
+        extra_totals: Dict[str, float] = {}
+        for c in extra_cols:
+            extra_totals[c] = float(pd.to_numeric(work[c], errors="coerce").fillna(0.0).sum())
 
-            if mode == "Abs(Value)":
-                work["_rank_key"] = work["_metric_value"].abs()
-            else:
-                work["_rank_key"] = work["_metric_value"]
+        # TOTAL row
+        total_val = float(work["_metric_value"].sum())
+        total_row = {c: pd.NA for c in (["section", "rank", "_metric_value"] + fields + extra_cols)}
+        total_row["section"] = "TOTAL"
+        total_row["rank"] = "Σ"
+        total_row["_metric_value"] = total_val
 
-            if include_top:
-                top = work.nlargest(n, "_rank_key").copy()
-                top["metric"] = m
-                top["rank_type"] = "Top"
-                top["rank"] = range(1, len(top) + 1)
-                top = add_total_row(top, m, "Top")
-                rows.append(top)
+        # CEO deluxe labels
+        for key in ("instrument", "day", "portfolio"):
+            if key in fields:
+                total_row[key] = "ALL"
 
-            if include_bottom:
-                bot = work.nsmallest(n, "_rank_key").copy()
-                bot["metric"] = m
-                bot["rank_type"] = "Bottom"
-                bot["rank"] = range(1, len(bot) + 1)
-                bot = add_total_row(bot, m, "Bottom")
-                rows.append(bot)
+        for c, v in extra_totals.items():
+            total_row[c] = v
 
-        if not rows:
-            return pd.DataFrame()
+        out = pd.concat([top, bot, pd.DataFrame([total_row])], ignore_index=True)
 
-        out = pd.concat(rows, axis=0, ignore_index=True)
-
-        cols = ["metric", "rank_type", "rank", "_metric_value"] + fields
+        cols = ["section", "rank", "_metric_value"] + fields + extra_cols
         cols = [c for c in cols if c in out.columns]
         out = out[cols].rename(columns={"_metric_value": "metric_value"})
 
-        def sign_icon(v: float, is_total: bool) -> str:
-            if is_total:
+        # enforce integers
+        out["metric_value"] = cls._fmt_int_series(out["metric_value"])
+        for c in extra_cols:
+            out[c] = cls._fmt_int_series(out[c])
+
+        # sign column
+        def sign_icon(v, section: str) -> str:
+            if section == "TOTAL":
                 return "Σ"
-            return "🟢" if v >= 0 else "🔴"
+            try:
+                vv = float(v)
+            except Exception:
+                vv = 0.0
+            return "🟢" if vv >= 0 else "🔴"
 
-        out.insert(
-            0,
-            "sign",
-            [
-                sign_icon(float(v), str(r) == "TOTAL")
-                for v, r in zip(out["metric_value"].astype("float64"), out["rank"])
-            ],
-        )
+        out.insert(0, "sign", [sign_icon(v, s) for v, s in zip(out["metric_value"], out["section"])])
 
-        # Keep blocks together
-        out.sort_values(["metric", "rank_type"], inplace=True, kind="mergesort")
+        # Order: Top, Bottom, TOTAL (Bottom is already visually reversed via bot)
+        section_order = {"Top": 0, "Bottom": 1, "TOTAL": 2}
+        out["_sec_ord"] = out["section"].map(section_order).fillna(9).astype(int)
+
+        rank_num = pd.to_numeric(out["rank"], errors="coerce")
+        out["_rank_num"] = rank_num
+        top_mask = out["section"].astype("string") == "Top"
+        bottom_mask = out["section"].astype("string") == "Bottom"
+        out["_rank_key"] = out["_rank_num"].astype("float64")
+        out.loc[bottom_mask, "_rank_key"] = -out.loc[bottom_mask, "_rank_key"]  # invert => descending
+        out.loc[~(top_mask | bottom_mask), "_rank_key"] = 1e12
+
+        out.sort_values(["_sec_ord", "_rank_key"], inplace=True, kind="mergesort")
+        out.drop(columns=["_sec_ord", "_rank_num", "_rank_key"], inplace=True)
         out.reset_index(drop=True, inplace=True)
-        return out
+
+        # KPIs
+        top_sum = int(pd.to_numeric(top["_metric_value"], errors="coerce").fillna(0).sum()) if len(top) else 0
+        bottom_sum = int(pd.to_numeric(bot_raw["_metric_value"], errors="coerce").fillna(0).sum()) if len(bot_raw) else 0
+        total_sum = int(round(total_val))
+        kpis = {
+            "top_sum": top_sum,
+            "bottom_sum": bottom_sum,
+            "total_sum": total_sum,
+            "net": top_sum + bottom_sum,
+        }
+
+        return out, kpis
 
     # ----------------------------
     # Presets
     # ----------------------------
 
     def _get_current_preset(self) -> Dict:
-        metrics = self._selected_from_listbox(self.metrics_lb)
         fields = self._selected_from_listbox(self.fields_lb)
+        pnl_cols = self._selected_from_listbox(self.pnl_lb)
         return {
             "from": self.from_var.get().strip(),
             "to": self.to_var.get().strip(),
             "n": int(self.n_var.get()),
-            "mode": self.mode_var.get(),
-            "include_top": bool(self.include_top_var.get()),
-            "include_bottom": bool(self.include_bottom_var.get()),
-            "metrics": metrics,
+            "metric": self.metric_var.get(),
+            "portfolio": self.portfolio_var.get(),
             "fields": fields,
+            "pnl_cols": pnl_cols,
         }
 
     def _apply_preset(self, preset: Dict) -> None:
@@ -457,15 +521,14 @@ class ReportSheet(ttk.Frame):
             self.to_var.set(preset["to"])
         if "n" in preset:
             self.n_var.set(int(preset["n"]))
-        if preset.get("mode") in ("Value", "Abs(Value)"):
-            self.mode_var.set(preset["mode"])
 
-        self.include_top_var.set(bool(preset.get("include_top", True)))
-        self.include_bottom_var.set(bool(preset.get("include_bottom", True)))
+        if preset.get("metric"):
+            self.metric_var.set(preset["metric"])
+        if preset.get("portfolio"):
+            self.portfolio_var.set(preset["portfolio"])
 
-        self._select_listbox_values(self.metrics_lb, preset.get("metrics", []))
         self._select_listbox_values(self.fields_lb, preset.get("fields", []))
-
+        self._select_listbox_values(self.pnl_lb, preset.get("pnl_cols", []))
         self._apply_report()
 
     @staticmethod
@@ -542,25 +605,19 @@ class ReportSheet(ttk.Frame):
         lb.bind("<Double-1>", lambda e: load_selected())
 
     def _reset_controls(self) -> None:
-        self.n_var.set(5)
-        self.mode_var.set("Value")
-        self.include_top_var.set(True)
-        self.include_bottom_var.set(True)
+        self.n_var.set(10)
+        if self.metric_cb["values"]:
+            vals = list(self.metric_cb["values"])
+            self.metric_var.set("Total" if "Total" in vals else vals[0])
+        self.portfolio_var.set("ALL")
 
-        self._lb_select_none(self.metrics_lb)
         self._lb_select_none(self.fields_lb)
-
-        for i in range(self.metrics_lb.size()):
-            if self.metrics_lb.get(i) == "Total":
-                self.metrics_lb.selection_set(i)
-                break
-        else:
-            if self.metrics_lb.size() > 0:
-                self.metrics_lb.selection_set(0)
-
         for i in range(self.fields_lb.size()):
             if self.fields_lb.get(i) in ("instrument", "day", "portfolio", "counterparty", "underlying"):
                 self.fields_lb.selection_set(i)
+
+        if self.pnl_lb.size() > 0:
+            self.pnl_lb.selection_set(0, "end")
 
         self._apply_report()
 
@@ -576,17 +633,17 @@ class ReportSheet(ttk.Frame):
 
         d_from = self.from_var.get().strip()
         d_to = self.to_var.get().strip()
-        mode = self.mode_var.get()
         n = int(self.n_var.get())
+        metric = self.metric_var.get()
+        portfolio = self.portfolio_var.get()
 
         rng = self._df_range if self._df_range is not None else pd.DataFrame()
-        metrics = self._selected_from_listbox(self.metrics_lb)
-        summary_lines = ReportSheet._make_summary_lines(rng, metrics)
+        summary_lines = self._make_summary_lines(rng)
 
-        html = self._report_to_html(df, d_from, d_to, mode, n, summary_lines)
+        html = self._report_to_html(df, d_from, d_to, n, metric, portfolio, summary_lines)
 
         os.makedirs("reports", exist_ok=True)
-        fname = f"report_{d_from}_to_{d_to}.html".replace(":", "-")
+        fname = f"report_{metric}_{d_from}_to_{d_to}.html".replace(":", "-").replace(" ", "_")
         path = os.path.join("reports", fname)
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -600,7 +657,7 @@ class ReportSheet(ttk.Frame):
         messagebox.showinfo("Create HTML", f"Saved:\n{os.path.abspath(path)}\n\n(Path copied to clipboard)")
 
     @staticmethod
-    def _report_to_html(df: pd.DataFrame, d_from: str, d_to: str, mode: str, n: int, summary_lines: List[str]) -> str:
+    def _report_to_html(df: pd.DataFrame, d_from: str, d_to: str, n: int, metric: str, portfolio: str, summary_lines: List[str]) -> str:
         css = """
         <style>
           body { font-family: Segoe UI, Arial, sans-serif; background: #F6F8FC; color: #0B1220; padding: 24px; }
@@ -609,13 +666,14 @@ class ReportSheet(ttk.Frame):
           .meta { color: #5E6B85; font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
           h2 { margin: 0 0 8px 0; font-size: 16px; }
           table { width: 100%; border-collapse: collapse; font-size: 12px; }
-          th, td { border-bottom: 1px solid #EEF3FF; padding: 8px 10px; text-align: left; white-space: nowrap; }
-          th { background: #F8FAFF; position: sticky; top: 0; z-index: 1; }
+          th, td { border-bottom: 1px solid #EEF3FF; padding: 8px 10px; white-space: nowrap; }
+          th { background: #F8FAFF; text-align: left; }
           tr:hover td { background: #F3F6FF; }
-          .top { color: #0B6B2A; font-weight: 700; }
-          .bottom { color: #B91C1C; font-weight: 700; }
           .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid #D8E1F0; background: #F8FAFF; }
           .summary { white-space: pre-line; }
+          .num { text-align: right; font-variant-numeric: tabular-nums; }
+          .txt { text-align: center; }
+          .metaRow td { background: #EEF3FF; font-weight: 700; }
         </style>
         """
 
@@ -625,27 +683,66 @@ class ReportSheet(ttk.Frame):
           <h1>Post-Trade Report</h1>
           <div class="meta">
             Range: <span class="pill">{d_from}</span> → <span class="pill">{d_to}</span>
+            • Metric: <span class="pill">{metric}</span>
+            • Portfolio: <span class="pill">{portfolio}</span>
             • N: <span class="pill">{n}</span>
-            • Ranking: <span class="pill">{mode}</span>
             • Rows: <span class="pill">{len(df)}</span>
             <div class="summary">{summary_html}</div>
           </div>
         </div>
         """
 
+        block = df.copy()
+
+        # Format numeric columns as ints with commas
+        for c in block.columns:
+            if c in ("sign", "section", "rank"):
+                continue
+            if pd.api.types.is_numeric_dtype(block[c]) or c == "metric_value":
+                block[c] = (
+                    pd.to_numeric(block[c], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                    .map(lambda x: f"{x:,}")
+                )
+
+        # Build table with right-align for numeric-like columns
+        num_cols = set(["metric_value"])
+        for c in block.columns:
+            if c in ("sign", "section", "rank"):
+                continue
+            # after formatting everything is str, so we decide by name heuristic:
+            if c == "metric_value":
+                num_cols.add(c)
+
         parts = [f"<!doctype html><html><head><meta charset='utf-8'>{css}</head><body>", header]
+        parts.append("<div class='card'><h2>Top / Bottom / TOTAL</h2>")
 
-        for metric in df["metric"].astype("string").unique().tolist():
-            d_m = df[df["metric"].astype("string") == metric].copy()
+        parts.append("<table>")
+        parts.append("<thead><tr>")
+        for c in block.columns:
+            parts.append(f"<th>{c}</th>")
+        parts.append("</tr></thead>")
 
-            for rtype in d_m["rank_type"].astype("string").unique().tolist():
-                block = d_m[d_m["rank_type"].astype("string") == rtype].copy()
-                cls = "top" if rtype == "Top" else "bottom"
-                parts.append(f"<div class='card'><h2>{metric} • <span class='{cls}'>{rtype}</span></h2>")
-                parts.append(block.to_html(index=False, escape=True))
-                parts.append("</div>")
+        parts.append("<tbody>")
+        for _, row in block.iterrows():
+            cls_row = "metaRow" if str(row.get("section", "")) == "TOTAL" else ""
+            parts.append(f"<tr class='{cls_row}'>")
+            for c in block.columns:
+                val = row.get(c, "")
+                if pd.isna(val):
+                    val = ""
+                if c in ("sign", "section", "rank"):
+                    td_cls = "txt"
+                elif c in num_cols:
+                    td_cls = "num"
+                else:
+                    td_cls = "txt"
+                parts.append(f"<td class='{td_cls}'>{val}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
 
-        parts.append("</body></html>")
+        parts.append("</div></body></html>")
         return "\n".join(parts)
 
 
@@ -740,28 +837,40 @@ class ReportDataTable(ttk.Frame):
         self._clear_tree()
         self.tree["columns"] = cols
 
+        # numeric cols -> right align
+        numeric_cols: set[str] = set(["metric_value"])
+        try:
+            for c in cols:
+                if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+                    numeric_cols.add(c)
+        except Exception:
+            pass
+
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
 
-        rank_type_idx = cols.index("rank_type") if "rank_type" in cols else None
-        rank_idx = cols.index("rank") if "rank" in cols else None
+            if c in ("sign", "section", "rank"):
+                self.tree.column(c, width=110, minwidth=80, anchor="w", stretch=True)
+            elif c in numeric_cols:
+                self.tree.column(c, width=110, minwidth=80, anchor="e", stretch=True)
+            else:
+                self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
+
+        section_idx = cols.index("section") if "section" in cols else None
 
         cache = self._cache
         for i in range(self._cache_len):
             values = [cache[c][i] for c in cols]
 
             tag = "even" if (i % 2 == 0) else "odd"
-
-            if rank_idx is not None and str(values[rank_idx]) == "TOTAL":
-                tag = "totalrow"
-            else:
-                if rank_type_idx is not None:
-                    rt = values[rank_type_idx]
-                    if rt == "Top":
-                        tag = "toprow"
-                    elif rt == "Bottom":
-                        tag = "bottomrow"
+            if section_idx is not None:
+                sec = values[section_idx]
+                if sec == "Top":
+                    tag = "toprow"
+                elif sec == "Bottom":
+                    tag = "bottomrow"
+                elif sec == "TOTAL":
+                    tag = "totalrow"
 
             self.tree.insert("", "end", values=values, tags=(tag,))
 
@@ -837,7 +946,6 @@ class ReportDataTable(ttk.Frame):
         for c in self._rendered_cols:
             self.tree.column(c, width=widths[c], stretch=True)
 
-    # SIMPLE + STABLE columns dialog (like your working one)
     def _open_columns_dialog_simple(self) -> None:
         df = self._df
         if df is None or df.empty:
@@ -885,7 +993,6 @@ class ReportDataTable(ttk.Frame):
             chosen = [all_cols[i] for i in sel_idx]
             self._visible_cols = chosen
 
-            # re-render using current view
             if self._df_view is None:
                 self._df_view = self._df
 
