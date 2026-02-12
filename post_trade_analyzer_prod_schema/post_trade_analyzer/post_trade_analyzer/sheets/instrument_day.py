@@ -787,7 +787,7 @@ class InstDayPlotSubsheet(ttk.Frame):
         w = max(420, c.winfo_width())
         h = max(120, c.winfo_height())
 
-        left, right, top, bottom = 70, 20, 22, 40
+        left, right, top, bottom = 70, 70, 22, 40
         x0, y0 = left, top
         x1, y1 = w - right, h - bottom
 
