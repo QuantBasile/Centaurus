@@ -11,15 +11,14 @@ import pandas as pd
 from .theme import FuturisticTheme
 from .ui_header import HeaderBar
 from .ui_nav import LeftNav
-from .utils.schema import validate_trade_df
 from .utils.time_utils import parse_iso_date
 from .data_provider import TradeDataProvider
 
 from .sheets.raw_data import RawDataSheet
-from .sheets.instrument_day import InstrumentDaySheet
+from .sheets.adjustments import AdjustmentsSheet
 from .sheets.end_of_day import EndOfDaySheet
-from .sheets.report import ReportSheet
-
+from .sheets.instrument_day import InstrumentDaySheet
+from .sheets.day_report import DayReportSheet
 
 
 class PostTradeApp(tk.Tk):
@@ -29,7 +28,9 @@ class PostTradeApp(tk.Tk):
 
         self.provider = provider
         self._result_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
-        self._current_df: Optional[pd.DataFrame] = None
+
+        self._trades_df: Optional[pd.DataFrame] = None
+        self._adj_df: Optional[pd.DataFrame] = None
 
         self.header = HeaderBar(self, on_load=self.load_button_pressed)
 
@@ -51,29 +52,27 @@ class PostTradeApp(tk.Tk):
 
     def _init_sheets(self) -> None:
         raw = RawDataSheet(self.content)
-        instday = InstrumentDaySheet(self.content)
+        adj = AdjustmentsSheet(self.content)
         eod = EndOfDaySheet(self.content)
-        report = ReportSheet(self.content)
-
+        instday = InstrumentDaySheet(self.content)   # <-- NEW
+        dayrep = DayReportSheet(self.content)
     
-        self.sheets[getattr(raw, "sheet_id")] = raw
-        self.sheets[getattr(instday, "sheet_id")] = instday
-        self.sheets[getattr(eod, "sheet_id")] = eod
-        self.sheets[getattr(report, "sheet_id")] = report
+        self.sheets[raw.sheet_id] = raw
+        self.sheets[adj.sheet_id] = adj
+        self.sheets[eod.sheet_id] = eod
+        self.sheets[instday.sheet_id] = instday      # <-- NEW
+        self.sheets[dayrep.sheet_id] = dayrep
     
         self.nav.set_sheets(list(self.sheets.values()))
         for s in self.sheets.values():
             s.place(relx=0, rely=0, relwidth=1, relheight=1)
-
-
+                
     def show_sheet(self, sheet_id: str) -> None:
         if sheet_id not in self.sheets:
             return
         self.nav.set_selected(sheet_id)
-        sheet = self.sheets[sheet_id]
-        sheet.tkraise()
-        if self._current_df is not None:
-            getattr(sheet, "on_df_loaded")(self._current_df)
+        self.sheets[sheet_id].tkraise()
+        # PERF CRÍTICO: nunca recomputar en tab switch
 
     def load_button_pressed(self, from_s: str, to_s: str) -> None:
         try:
@@ -96,9 +95,8 @@ class PostTradeApp(tk.Tk):
 
     def _load_worker(self, from_date, to_date) -> None:
         try:
-            df = self.provider.load_trades(from_date, to_date)
-            validate_trade_df(df)
-            self._result_queue.put(("ok", df))
+            trades, adjustments = self.provider.load(from_date, to_date)
+            self._result_queue.put(("ok", (trades, adjustments)))
         except Exception as e:
             self._result_queue.put(("err", e))
 
@@ -110,14 +108,24 @@ class PostTradeApp(tk.Tk):
             return
 
         if kind == "ok":
-            df = payload  # type: ignore[assignment]
-            self._current_df = df
+            trades, adjustments = payload  # type: ignore[misc]
+
+            # Guardamos en app
+            self._trades_df = trades
+            self._adj_df = adjustments
+
+            # UI header
             self.header.set_loading(False)
             self.header.set_status("Loaded.")
-            self.header.set_rows_info(df)
+            self.header.set_rows_info(trades)
 
+            # Empujar UNA vez por carga (sin getattr dinámico)
             for s in self.sheets.values():
-                getattr(s, "on_df_loaded")(df)
+                if hasattr(s, "on_df_loaded"):
+                    s.on_df_loaded(self._trades_df)
+                if hasattr(s, "on_adjustment_loaded"):
+                    s.on_adjustment_loaded(self._adj_df)
+
         else:
             err = payload
             self.header.set_loading(False)

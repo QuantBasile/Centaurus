@@ -1,15 +1,40 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
 import pandas as pd
 
-from ..utils.table_utils import build_display_cache, sanitize_visible_cols
+from ..utils.table_utils import build_display_cache
 from ..utils.time_utils import parse_iso_date, us_open_berlin
+
+
+# ============================================================
+# Simple autocomplete combobox (fast)
+# ============================================================
+
+class AutocompleteCombobox(ttk.Combobox):
+    def __init__(self, master, *, values: List[str], **kwargs):
+        super().__init__(master, values=values, **kwargs)
+        self._all_values = list(values)
+        self.bind("<KeyRelease>", self._on_keyrelease)
+
+    def set_values(self, values: List[str]) -> None:
+        self._all_values = list(values)
+        self["values"] = self._all_values
+
+    def _on_keyrelease(self, event) -> None:
+        if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Tab"):
+            return
+        text = self.get().strip().lower()
+        if not text:
+            self["values"] = self._all_values
+            return
+        filtered = [v for v in self._all_values if text in v.lower()]
+        self["values"] = filtered if filtered else self._all_values
 
 
 class BaseSheet(ttk.Frame):
@@ -21,15 +46,24 @@ class BaseSheet(ttk.Frame):
 
 
 class InstrumentDaySheet(BaseSheet):
+    """
+    Refactor:
+      - Selection is primarily by underlyingName (autocomplete) + date.
+      - Optional instrument filter (autocomplete) to narrow further.
+      - Data tab: SIMPLE + FAST (no column chooser, no autofit, stretch=False).
+      - Plot tab: keep style, remove zoom drag (laggy), keep redraw/legend.
+    """
+
     sheet_id = "instday"
-    sheet_title = "Instrument • Day"
+    sheet_title = "Und • Day"
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
         self._df_all: Optional[pd.DataFrame] = None
         self._df_base: Optional[pd.DataFrame] = None
 
-        self.instrument_var = tk.StringVar()
+        self.underlying_var = tk.StringVar()
+        #self.instrument_var = tk.StringVar()
         self.date_var = tk.StringVar()
 
         self._build()
@@ -37,35 +71,30 @@ class InstrumentDaySheet(BaseSheet):
     def _build(self) -> None:
         top = ttk.Frame(self)
         top.pack(fill="x", padx=14, pady=(14, 10))
-        ttk.Label(top, text="Instrument • Day", style="Title.TLabel").pack(side="left")
+        ttk.Label(top, text="Underlying/Instrument • Day", style="Title.TLabel").pack(side="left")
 
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=14, pady=(0, 10))
 
-        ttk.Label(controls, text="Instrument", style="Muted.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
+        ttk.Label(controls, text="UnderlyingName", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.underlying_cb = AutocompleteCombobox(
+            controls, values=[], textvariable=self.underlying_var, state="normal", width=22
         )
-        self.instrument_cb = ttk.Combobox(
-            controls, textvariable=self.instrument_var, state="readonly", width=18
-        )
-        self.instrument_cb.grid(row=1, column=0, sticky="w", padx=(0, 14))
+        self.underlying_cb.grid(row=1, column=0, sticky="w", padx=(0, 14))
 
-        ttk.Label(controls, text="Date (YYYY-MM-DD)", style="Muted.TLabel").grid(
-            row=0, column=1, sticky="w", padx=(0, 8)
-        )
+        ttk.Label(controls, text="Date (YYYY-MM-DD)", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
         self.date_entry = ttk.Entry(controls, textvariable=self.date_var, width=12)
-        self.date_entry.grid(row=1, column=1, sticky="w", padx=(0, 14))
+        self.date_entry.grid(row=1, column=2, sticky="w", padx=(0, 14))
 
-        self.apply_btn = ttk.Button(
-            controls, text="Apply", style="Accent.TButton", command=self._apply_base_filter
-        )
-        self.apply_btn.grid(row=1, column=2, sticky="w")
+        self.apply_btn = ttk.Button(controls, text="Apply", style="Accent.TButton", command=self._apply_base_filter)
+        self.apply_btn.grid(row=1, column=3, sticky="w")
+
+        self.clear_btn = ttk.Button(controls, text="Clear", command=self._clear_filters)
+        self.clear_btn.grid(row=1, column=4, sticky="w", padx=(8, 0))
 
         self.info_var = tk.StringVar(value="Load data to begin.")
-        ttk.Label(controls, textvariable=self.info_var, style="Muted.TLabel").grid(
-            row=1, column=3, sticky="w", padx=(14, 0)
-        )
-        controls.columnconfigure(3, weight=1)
+        ttk.Label(controls, textvariable=self.info_var, style="Muted.TLabel").grid(row=1, column=5, sticky="w", padx=(14, 0))
+        controls.columnconfigure(5, weight=1)
 
         card = ttk.Frame(self, style="Card.TFrame")
         card.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -82,23 +111,41 @@ class InstrumentDaySheet(BaseSheet):
         self.nb.add(self.sub_data, text="Data")
         self.nb.add(self.sub_plot, text="Plot")
 
-        # Apply only when pressing Apply (or Enter on date)
+        # Apply only on Enter / Apply
         self.date_entry.bind("<Return>", lambda e: self._apply_base_filter())
-        self.instrument_cb.bind("<<ComboboxSelected>>", lambda e: None)
 
     def on_df_loaded(self, df: pd.DataFrame) -> None:
         self._df_all = df
 
-        inst = sorted([x for x in df["instrument"].dropna().astype("string").unique().tolist() if x])
-        if not inst:
-            inst = ["(none)"]
-        self.instrument_cb["values"] = inst
-        if not self.instrument_var.get() or self.instrument_var.get() not in inst:
-            self.instrument_var.set(inst[0])
+        if df is None or df.empty:
+            self.underlying_cb.set_values([])
+            self.instrument_cb.set_values([])
+            self.info_var.set("No data loaded.")
+            self.sub_data.set_df(None)
+            self.sub_plot.set_df(None)
+            return
+
+        # Populate values
+        underlyings = sorted([x for x in df["underlyingName"].dropna().astype(str).unique().tolist() if x])
+
+        self.underlying_cb.set_values(underlyings)
+
+        # Defaults
+        if not self.underlying_var.get() and underlyings:
+            self.underlying_var.set(underlyings[0])
 
         if len(df) > 0 and not self.date_var.get():
-            self.date_var.set(pd.Timestamp(df["tradeTime"].iloc[0]).date().isoformat())
+            # Use first row's date
+            tt0 = pd.to_datetime(df["tradeTime"].iloc[0], errors="coerce")
+            if pd.notna(tt0):
+                self.date_var.set(tt0.date().isoformat())
 
+        self._apply_base_filter()
+
+    def _clear_filters(self) -> None:
+        #self.instrument_var.set("")
+        # keep underlying if you want; or clear both
+        # self.underlying_var.set("")
         self._apply_base_filter()
 
     def _apply_base_filter(self) -> None:
@@ -109,24 +156,38 @@ class InstrumentDaySheet(BaseSheet):
             self.sub_plot.set_df(None)
             return
 
-        inst = self.instrument_var.get().strip()
+        u = self.underlying_var.get().strip()
+
         try:
             d = parse_iso_date(self.date_var.get())
         except ValueError:
             self.info_var.set("Invalid date format. Use YYYY-MM-DD.")
             return
 
-        base = df[df["instrument"].astype("string") == inst].copy()
-        base = base[base["tradeTime"].dt.date == d].copy()
-        base.sort_values("tradeTime", inplace=True, kind="mergesort")
-        base.reset_index(drop=True, inplace=True)
+        # Fast filtering without redundant copies
+        view = df
+        if u:
+            view = view[view["underlyingName"].astype(str) == u]
+        # Date filter
+        # (Your df already has "date" column in TRADES_COLS; use it for speed)
+        if "date" in view.columns:
+            view = view[view["date"] == d]
+        else:
+            view = view[view["tradeTime"].dt.date == d]
 
-        self._df_base = base
-        self.info_var.set(f"{inst} • {d.isoformat()} • {len(base):,} rows")
+        view = view.sort_values("tradeTime", kind="mergesort").reset_index(drop=True)
 
-        self.sub_data.set_df(base)
-        self.sub_plot.set_df(base, day=d)
+        self._df_base = view
+        tag_u = u if u else "(all underlyings)"
+        self.info_var.set(f"{tag_u} • {d.isoformat()} • {len(view):,} rows")
 
+        self.sub_data.set_df(view)
+        self.sub_plot.set_df(view, day=d)
+
+
+# ============================================================
+# Data subsheet: SIMPLE + FAST (sortable table only)
+# ============================================================
 
 class InstDayDataSubsheet(ttk.Frame):
     def __init__(self, master: tk.Misc) -> None:
@@ -138,50 +199,18 @@ class InstDayDataSubsheet(ttk.Frame):
         self._df_base: Optional[pd.DataFrame] = None
         self._df_view: Optional[pd.DataFrame] = None
 
-        self._visible_cols: Optional[List[str]] = None
-        self._rendered_cols: List[str] = []
-
         self._cache: Dict[str, List[str]] = {}
         self._cache_len: int = 0
 
-        self.bool_vars: Dict[str, tk.StringVar] = {}
-        self._bool_widgets: List[ttk.Combobox] = []
-
-        self._resize_after_id: Optional[str] = None
         self._build()
 
     def _build(self) -> None:
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=10, pady=(10, 8))
 
-        self.columns_btn = ttk.Button(controls, text="Columns", command=self._open_columns_dialog_fast)
-        self.columns_btn.pack(side="left")
-
-        self.apply_filters_btn = ttk.Button(
-            controls, text="Apply filters", style="Accent.TButton", command=self._apply_filters
-        )
-        self.apply_filters_btn.pack(side="left", padx=8)
-
         self.info_var = tk.StringVar(value="No data.")
         ttk.Label(controls, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
 
-        # Filters card (ONLY booleans)
-        fcard = ttk.Frame(self, style="Card.TFrame")
-        fcard.pack(fill="x", padx=10, pady=(0, 10))
-        fpad = ttk.Frame(fcard, style="Card.TFrame")
-        fpad.pack(fill="x", padx=10, pady=10)
-
-        ttk.Label(fpad, text="Filters", style="CardTitle.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
-        )
-
-        self.bool_frame = ttk.Frame(fpad, style="Card.TFrame")
-        self.bool_frame.grid(row=1, column=0, sticky="w")
-        ttk.Label(self.bool_frame, text="Booleans", style="CardBody.TLabel").grid(
-            row=0, column=0, columnspan=10, sticky="w", pady=(0, 4)
-        )
-
-        # Table card
         tcard = ttk.Frame(self, style="Card.TFrame")
         tcard.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -203,7 +232,7 @@ class InstDayDataSubsheet(ttk.Frame):
         self.tree.tag_configure("odd", background="#FFFFFF")
         self.tree.tag_configure("even", background="#F8FAFF")
 
-        #self.tree.bind("<Configure>", self._on_tree_configure)
+        # PERF: no autofit, no resize handler, stretch=False always
 
     def set_df(self, df: Optional[pd.DataFrame]) -> None:
         self._df_base = df
@@ -214,63 +243,12 @@ class InstDayDataSubsheet(ttk.Frame):
         if df is None or df.empty:
             self.info_var.set("No rows.")
             self._clear_tree()
-            self._build_bool_filters([])
-            self._visible_cols = None
             self._cache.clear()
             self._cache_len = 0
             return
 
-        bool_cols = [c for c in df.columns if c.startswith("flag_")]
-        self._build_bool_filters(bool_cols)
-
-        if self._visible_cols is None:
-            self._visible_cols = list(df.columns)
-
-        self._apply_filters()
-
-    def _build_bool_filters(self, bool_cols: List[str]) -> None:
-        for w in self._bool_widgets:
-            w.destroy()
-        self._bool_widgets.clear()
-        self.bool_vars.clear()
-
-        options = ["All", "True", "False"]
-        per_row = 5
-
-        for i, col in enumerate(bool_cols):
-            r = 1 + (i // per_row) * 2
-            c = (i % per_row) * 2
-
-            ttk.Label(self.bool_frame, text=col, style="CardBody.TLabel").grid(
-                row=r, column=c, sticky="w", padx=(0, 6)
-            )
-            v = tk.StringVar(value="All")
-            self.bool_vars[col] = v
-            cb = ttk.Combobox(
-                self.bool_frame, textvariable=v, values=options, state="readonly", width=6
-            )
-            cb.grid(row=r, column=c + 1, sticky="w", padx=(0, 10), pady=(0, 4))
-            self._bool_widgets.append(cb)
-
-    def _apply_filters(self) -> None:
-        df = self._df_base
-        if df is None or df.empty:
-            self._df_view = df
-            self._clear_tree()
-            self.info_var.set("No rows.")
-            return
-
-        view = df
-        for col, v in self.bool_vars.items():
-            if v.get() == "True":
-                view = view[view[col] == True]  # noqa: E712
-            elif v.get() == "False":
-                view = view[view[col] == False]  # noqa: E712
-
-        self._df_view = view.reset_index(drop=True)
-        self.info_var.set(f"Showing {len(self._df_view):,} rows (after filters).")
-
-        self._cache, self._cache_len = build_display_cache(self._df_view)
+        self._cache, self._cache_len = build_display_cache(df)
+        self.info_var.set(f"{len(df):,} rows")
         self._render_from_cache()
 
     def _render_from_cache(self) -> None:
@@ -279,23 +257,19 @@ class InstDayDataSubsheet(ttk.Frame):
             self._clear_tree()
             return
 
-        cols = sanitize_visible_cols(list(df.columns), self._visible_cols)
-        self._rendered_cols = cols
-
+        cols = list(df.columns)
         self._clear_tree()
 
         self.tree["columns"] = cols
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
+            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=False)
 
         cache = self._cache
         for i in range(self._cache_len):
             values = [cache[c][i] for c in cols]
             tag = "even" if (i % 2 == 0) else "odd"
             self.tree.insert("", "end", values=values, tags=(tag,))
-
-        self._autofit_from_cache(sample_rows=100)
 
     def _sort_by(self, col: str) -> None:
         df = self._df_view
@@ -312,7 +286,7 @@ class InstDayDataSubsheet(ttk.Frame):
             self._df_view = df.sort_values(by=col, ascending=self._sort_asc, kind="mergesort").reset_index(drop=True)
         except Exception:
             self._df_view = (
-                df.assign(_tmp=df[col].astype("string"))
+                df.assign(_tmp=df[col].astype(str))
                 .sort_values(by="_tmp", ascending=self._sort_asc, kind="mergesort")
                 .drop(columns="_tmp")
                 .reset_index(drop=True)
@@ -325,163 +299,30 @@ class InstDayDataSubsheet(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = []
 
-    #def _on_tree_configure(self, _event) -> None:
-    #    if self._resize_after_id is not None:
-    #        self.after_cancel(self._resize_after_id)
-    #    self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
 
-    def _autofit_from_cache(self, sample_rows: int = 500) -> None:
-        if not self._rendered_cols or self._cache_len == 0:
-            return
-    
-        import tkinter.font as tkfont
-        body_font = tkfont.nametofont("TkDefaultFont")
-        heading_font = tkfont.Font(
-            family=body_font.actual("family"),
-            size=body_font.actual("size"),
-            weight="bold",
-        )
-    
-        pad = 34
-        n = min(sample_rows, self._cache_len)
-        cache = self._cache
-    
-        widths = {}
-        for c in self._rendered_cols:
-            w = heading_font.measure(c) + pad
-            col_vals = cache.get(c, [])
-            for i in range(n):
-                ww = body_font.measure(col_vals[i]) + pad
-                if ww > w:
-                    w = ww
-            widths[c] = w
-    
-        for c in self._rendered_cols:
-            self.tree.column(c, width=widths[c], stretch=False)
-
-
-    def _open_columns_dialog_fast(self) -> None:
-        df = self._df_view
-        if df is None or df.empty:
-            messagebox.showinfo("Columns", "No data to show.")
-            return
-
-        all_cols = list(df.columns)
-        visible_set = set(self._visible_cols or all_cols)
-
-        win = tk.Toplevel(self)
-        win.title("Select columns")
-        win.geometry("420x520")
-        win.configure(bg="#F5F7FB")
-        win.transient(self.winfo_toplevel())
-        win.grab_set()
-
-        header = ttk.Frame(win)
-        header.pack(fill="x", padx=12, pady=(12, 8))
-        ttk.Label(header, text="Columns", style="Title.TLabel").pack(side="left")
-
-        search_frame = ttk.Frame(win)
-        search_frame.pack(fill="x", padx=12, pady=(0, 8))
-        ttk.Label(search_frame, text="Search", style="Muted.TLabel").pack(side="left")
-        q_var = tk.StringVar()
-        q_entry = ttk.Entry(search_frame, textvariable=q_var)
-        q_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=12, pady=(0, 8))
-
-        outer = ttk.Frame(win)
-        outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-
-        lb = tk.Listbox(outer, selectmode="extended", activestyle="none", exportselection=False, height=20)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=lb.yview)
-        lb.configure(yscrollcommand=sb.set)
-        lb.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        filtered_cols: List[str] = []
-
-        def repopulate() -> None:
-            nonlocal filtered_cols
-            q = q_var.get().strip().lower()
-            filtered_cols = [c for c in all_cols if (q in c.lower())] if q else all_cols[:]
-
-            lb.delete(0, "end")
-            for c in filtered_cols:
-                lb.insert("end", c)
-
-            for i, c in enumerate(filtered_cols):
-                if c in visible_set:
-                    lb.selection_set(i)
-
-        def select_all() -> None:
-            for i in range(len(filtered_cols)):
-                lb.selection_set(i)
-
-        def select_none() -> None:
-            lb.selection_clear(0, "end")
-
-        ttk.Button(btns, text="Select all (filtered)", command=select_all).pack(side="left")
-        ttk.Button(btns, text="Select none (filtered)", command=select_none).pack(side="left", padx=8)
-
-        q_var.trace_add("write", lambda *_: repopulate())
-        repopulate()
-
-        footer = ttk.Frame(win)
-        footer.pack(fill="x", padx=12, pady=(0, 12))
-
-        def apply_and_close() -> None:
-            sel = set(filtered_cols[i] for i in lb.curselection())
-            q = q_var.get().strip().lower()
-            if q:
-                for c in filtered_cols:
-                    visible_set.discard(c)
-                visible_set.update(sel)
-            else:
-                visible_set.clear()
-                visible_set.update(sel)
-
-            if not visible_set:
-                messagebox.showwarning("Columns", "Select at least one column.")
-                return
-
-            self._visible_cols = [c for c in all_cols if c in visible_set]
-            self._render_from_cache()
-            win.destroy()
-
-        ttk.Button(footer, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(footer, text="Apply", style="Accent.TButton", command=apply_and_close).pack(side="right", padx=8)
-
-        q_entry.focus_set()
-
+# ============================================================
+# Plot subsheet: keep style, remove zoom (laggy), keep legend
+# ============================================================
 
 class InstDayPlotSubsheet(ttk.Frame):
     """
-    Simple, fast plotting:
-    - left sidebar for selection + legend
-    - select all / none for PnL & Delta
-    - simple zoom: drag horizontally in main plot; double-click resets
-    - minimal debounce on resize to avoid stutter
+    Performance-first:
+      - remove zoom drag (it looked cool but lagged)
+      - redraw only on button / debounced resize
+      - downsample points so the canvas stays fast
     """
 
     PNL_CANDIDATES = [
         "Total",
         "PremiaCum",
-        "SpreadsCapture",
-        "FullSpreadCapture",
-        "PnlVonDeltaCum",
+        "PnLVonDeltaCum",
         "feesCum",
-        "AufgeldCum",
+        "PnL",  # if exists
     ]
 
     DELTA_CANDIDATES = [
-        "CumDelta",
-        "CumDelta_stock",
-        "CumDelta_certificates_abandon",
-        "CumDelta_our_abandon",
-        "CumDelta_external_abandon",
-        "CumDelta_our_scheine",
-        "CumDelta_external_scheine",
+        "deltaCum",
+        "delta",
     ]
 
     def __init__(self, master: tk.Misc) -> None:
@@ -489,18 +330,9 @@ class InstDayPlotSubsheet(ttk.Frame):
         self._df: Optional[pd.DataFrame] = None
         self._day: Optional[date] = None
 
-        # zoom window (absolute timestamps). None => full 08:00-22:00
-        self._zoom: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
-
-        # drag state (zoom)
-        self._dragging = False
-        self._drag_x0: Optional[int] = None
-        self._drag_rect_main: Optional[int] = None
-
-        # debounce redraw for resize
         self._redraw_after_id: Optional[str] = None
-
         self._last_legend_items: List[Tuple[str, str, str]] = []
+
         self._build()
 
     def _build(self) -> None:
@@ -520,36 +352,31 @@ class InstDayPlotSubsheet(ttk.Frame):
         pad = ttk.Frame(self.left, style="Card.TFrame")
         pad.pack(fill="both", expand=True, padx=12, pady=12)
 
-        # PnL block + buttons
+        # PnL block
         pnl_header = ttk.Frame(pad, style="Card.TFrame")
         pnl_header.pack(fill="x")
         ttk.Label(pnl_header, text="PnL lines", style="Muted.TLabel").pack(side="left")
-        ttk.Button(pnl_header, text="All", width=6, command=self._pnl_select_all).pack(side="right")
-        ttk.Button(pnl_header, text="None", width=6, command=self._pnl_select_none).pack(side="right", padx=(0, 6))
+        ttk.Button(pnl_header, text="All", width=6, command=lambda: self._select_all(self.pnl_lb)).pack(side="right")
+        ttk.Button(pnl_header, text="None", width=6, command=lambda: self._select_none(self.pnl_lb)).pack(side="right", padx=(0, 6))
 
-        self.pnl_lb = tk.Listbox(
-            pad, selectmode="extended", activestyle="none", exportselection=False, height=8
-        )
+        self.pnl_lb = tk.Listbox(pad, selectmode="extended", activestyle="none", exportselection=False, height=8)
         self.pnl_lb.pack(fill="x", pady=(6, 12))
 
-        # Delta block + buttons
+        # Delta block
         d_header = ttk.Frame(pad, style="Card.TFrame")
         d_header.pack(fill="x")
         ttk.Label(d_header, text="Delta lines", style="Muted.TLabel").pack(side="left")
-        ttk.Button(d_header, text="All", width=6, command=self._delta_select_all).pack(side="right")
-        ttk.Button(d_header, text="None", width=6, command=self._delta_select_none).pack(side="right", padx=(0, 6))
+        ttk.Button(d_header, text="All", width=6, command=lambda: self._select_all(self.delta_lb)).pack(side="right")
+        ttk.Button(d_header, text="None", width=6, command=lambda: self._select_none(self.delta_lb)).pack(side="right", padx=(0, 6))
 
-        self.delta_lb = tk.Listbox(
-            pad, selectmode="extended", activestyle="none", exportselection=False, height=8
-        )
+        self.delta_lb = tk.Listbox(pad, selectmode="extended", activestyle="none", exportselection=False, height=6)
         self.delta_lb.pack(fill="x", pady=(6, 12))
 
         btn_row = ttk.Frame(pad, style="Card.TFrame")
         btn_row.pack(fill="x", pady=(4, 10))
 
-        ttk.Button(btn_row, text="Reset zoom", command=self._reset_zoom).pack(side="left")
         self.redraw_btn = ttk.Button(btn_row, text="Redraw", style="Accent.TButton", command=self.redraw)
-        self.redraw_btn.pack(side="left", padx=(8, 0))
+        self.redraw_btn.pack(side="left")
 
         ttk.Separator(pad, orient="horizontal").pack(fill="x", pady=(10, 10))
         ttk.Label(pad, text="Legend", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
@@ -572,32 +399,18 @@ class InstDayPlotSubsheet(ttk.Frame):
         self.canvas_main = tk.Canvas(main_wrap, highlightthickness=0, bg="#FFFFFF")
         self.canvas_main.pack(fill="both", expand=True)
 
-        # debounced redraw on resize
-        self.canvas_spot.bind("<Configure>", lambda e: self._schedule_redraw(220))
-        self.canvas_main.bind("<Configure>", lambda e: self._schedule_redraw(220))
-        self.legend.bind("<Configure>", lambda e: self._schedule_redraw(250))
+        # Debounced redraw on resize (kept, but drawing is lighter)
+        self.canvas_spot.bind("<Configure>", lambda e: self._schedule_redraw(250))
+        self.canvas_main.bind("<Configure>", lambda e: self._schedule_redraw(250))
+        self.legend.bind("<Configure>", lambda e: self._schedule_redraw(300))
 
-        # simple zoom: drag on main plot only
-        self.canvas_main.bind("<ButtonPress-1>", self._zoom_drag_start)
-        self.canvas_main.bind("<B1-Motion>", self._zoom_drag_move)
-        self.canvas_main.bind("<ButtonRelease-1>", self._zoom_drag_end)
-        self.canvas_main.bind("<Double-Button-1>", lambda e: self._reset_zoom())
+    def _select_all(self, lb: tk.Listbox) -> None:
+        lb.selection_set(0, "end")
 
-    # ---------- listbox helpers ----------
-    def _pnl_select_all(self) -> None:
-        self.pnl_lb.selection_set(0, "end")
+    def _select_none(self, lb: tk.Listbox) -> None:
+        lb.selection_clear(0, "end")
 
-    def _pnl_select_none(self) -> None:
-        self.pnl_lb.selection_clear(0, "end")
-
-    def _delta_select_all(self) -> None:
-        self.delta_lb.selection_set(0, "end")
-
-    def _delta_select_none(self) -> None:
-        self.delta_lb.selection_clear(0, "end")
-
-    # ---------- debounce ----------
-    def _schedule_redraw(self, delay_ms: int = 120) -> None:
+    def _schedule_redraw(self, delay_ms: int = 200) -> None:
         if self._redraw_after_id is not None:
             try:
                 self.after_cancel(self._redraw_after_id)
@@ -609,94 +422,9 @@ class InstDayPlotSubsheet(ttk.Frame):
         self._redraw_after_id = None
         self.redraw()
 
-    # ---------- zoom ----------
-    def _reset_zoom(self) -> None:
-        self._zoom = None
-        self._clear_zoom_rect()
-        self.redraw()
-
-    def _clear_zoom_rect(self) -> None:
-        if self._drag_rect_main is not None:
-            try:
-                self.canvas_main.delete(self._drag_rect_main)
-            except Exception:
-                pass
-        self._drag_rect_main = None
-
-    def _zoom_drag_start(self, event) -> None:
-        self._dragging = True
-        self._drag_x0 = int(event.x)
-        self._clear_zoom_rect()
-        self._drag_rect_main = self.canvas_main.create_rectangle(
-            event.x, 0, event.x, self.canvas_main.winfo_height(),
-            outline="#2E7BFF", width=1, fill="#2E7BFF", stipple="gray12"
-        )
-
-    def _zoom_drag_move(self, event) -> None:
-        if not self._dragging or self._drag_x0 is None or self._drag_rect_main is None:
-            return
-        self.canvas_main.coords(
-            self._drag_rect_main,
-            self._drag_x0, 0, int(event.x), self.canvas_main.winfo_height()
-        )
-
-    def _zoom_drag_end(self, event) -> None:
-        if not self._dragging or self._drag_x0 is None:
-            self._clear_zoom_rect()
-            return
-
-        self._dragging = False
-        x0 = self._drag_x0
-        x1 = int(event.x)
-        self._drag_x0 = None
-
-        if abs(x1 - x0) < 12:
-            self._clear_zoom_rect()
-            return
-
-        df = self._df
-        day = self._day
-        if df is None or df.empty or day is None:
-            self._clear_zoom_rect()
-            return
-
-        # plot geometry must match _draw_main_plot()
-        w = max(520, self.canvas_main.winfo_width())
-        left, right = 70, 70
-        px0 = left
-        px1 = w - right
-        if px1 <= px0 + 5:
-            self._clear_zoom_rect()
-            return
-
-        a = max(px0, min(px1, min(x0, x1)))
-        b = max(px0, min(px1, max(x0, x1)))
-        if b <= a:
-            self._clear_zoom_rect()
-            return
-
-        start_dt_full = datetime.combine(day, time(8, 0, 0))
-        end_dt_full = datetime.combine(day, time(22, 0, 0))
-        total_sec = (end_dt_full - start_dt_full).total_seconds()
-
-        s0 = (a - px0) / (px1 - px0) * total_sec
-        s1 = (b - px0) / (px1 - px0) * total_sec
-        if s1 - s0 < 60:
-            self._clear_zoom_rect()
-            return
-
-        z0 = pd.Timestamp(start_dt_full) + pd.Timedelta(seconds=s0)
-        z1 = pd.Timestamp(start_dt_full) + pd.Timedelta(seconds=s1)
-        self._zoom = (z0, z1)
-
-        self._clear_zoom_rect()
-        self.redraw()
-
-    # ---------- data ----------
     def set_df(self, df: Optional[pd.DataFrame], day: Optional[date] = None) -> None:
         self._df = df
         self._day = day
-        self._zoom = None
 
         self.pnl_lb.delete(0, "end")
         self.delta_lb.delete(0, "end")
@@ -709,7 +437,6 @@ class InstDayPlotSubsheet(ttk.Frame):
         for s in delta_series:
             self.delta_lb.insert("end", s)
 
-        # default select first (light)
         if pnl_series:
             self.pnl_lb.selection_set(0)
         if delta_series:
@@ -717,7 +444,6 @@ class InstDayPlotSubsheet(ttk.Frame):
 
         self.redraw()
 
-    # ---------- render ----------
     def redraw(self) -> None:
         self.canvas_spot.delete("all")
         self.canvas_main.delete("all")
@@ -744,7 +470,6 @@ class InstDayPlotSubsheet(ttk.Frame):
         self._last_legend_items = legend_items
         self._draw_legend_sidebar(legend_items)
 
-    # ---------- helpers ----------
     def _draw_empty(self, canvas: tk.Canvas, msg: str) -> None:
         w = max(300, canvas.winfo_width())
         h = max(200, canvas.winfo_height())
@@ -770,17 +495,23 @@ class InstDayPlotSubsheet(ttk.Frame):
             y += 20
 
     def _get_window(self, day: date) -> Tuple[pd.Timestamp, pd.Timestamp]:
-        full_start = pd.Timestamp(datetime.combine(day, time(8, 0, 0)))
-        full_end = pd.Timestamp(datetime.combine(day, time(22, 0, 0)))
-        if self._zoom is None:
-            return full_start, full_end
-        z0, z1 = self._zoom
-        # clamp to full window
-        z0 = max(full_start, min(full_end, z0))
-        z1 = max(full_start, min(full_end, z1))
-        if z1 <= z0:
-            return full_start, full_end
-        return z0, z1
+        # fixed full window (zoom removed)
+        full_start = pd.Timestamp(f"{day.isoformat()} 08:00:00")
+        full_end = pd.Timestamp(f"{day.isoformat()} 22:00:00")
+        return full_start, full_end
+
+    def _downsample(self, secs: List[float], vals: List[float], max_points: int = 1400) -> Tuple[List[float], List[float]]:
+        n = len(secs)
+        if n <= max_points:
+            return secs, vals
+        step = max(1, n // max_points)
+        s2 = secs[::step]
+        v2 = vals[::step]
+        # ensure last point included
+        if s2[-1] != secs[-1]:
+            s2.append(secs[-1])
+            v2.append(vals[-1])
+        return s2, v2
 
     def _draw_spot_plot(self, df: pd.DataFrame, day: date) -> None:
         c = self.canvas_spot
@@ -794,14 +525,14 @@ class InstDayPlotSubsheet(ttk.Frame):
         start_dt, end_dt = self._get_window(day)
         total_sec = (end_dt - start_dt).total_seconds()
         if total_sec <= 0:
-            self._draw_empty(c, "Bad zoom window.")
+            self._draw_empty(c, "Bad window.")
             return
 
         if "tradeUnderlyingSpotRef" not in df.columns:
             self._draw_empty(c, "Missing tradeUnderlyingSpotRef.")
             return
 
-        t = df["tradeTime"]
+        t = pd.to_datetime(df["tradeTime"], errors="coerce")
         mask = (t >= start_dt) & (t <= end_dt)
         sub = df.loc[mask, ["tradeTime", "tradeUnderlyingSpotRef"]].copy()
         if sub.empty:
@@ -809,9 +540,13 @@ class InstDayPlotSubsheet(ttk.Frame):
             return
 
         sub.sort_values("tradeTime", inplace=True, kind="mergesort")
-        secs = (sub["tradeTime"] - start_dt).dt.total_seconds().astype("float64")
-        yvals = pd.to_numeric(sub["tradeUnderlyingSpotRef"], errors="coerce").astype("float64")
-        yclean = yvals.dropna()
+        secs = (pd.to_datetime(sub["tradeTime"]) - start_dt).dt.total_seconds().astype("float64").tolist()
+        yvals = pd.to_numeric(sub["tradeUnderlyingSpotRef"], errors="coerce").astype("float64").tolist()
+
+        # downsample for speed
+        secs, yvals = self._downsample(secs, yvals, max_points=1200)
+
+        yclean = pd.Series(yvals).dropna()
         if yclean.empty:
             self._draw_empty(c, "No spot data.")
             return
@@ -824,229 +559,180 @@ class InstDayPlotSubsheet(ttk.Frame):
         ymin -= pad
         ymax += pad
         
-        # y-axis labels (left)
-        for i in range(5):
-            frac = i / 4
-            yy = y1 - frac * (y1 - y0)
-            v = ymin + frac * (ymax - ymin)
-            c.create_text(
-                x0 - 8,
-                yy,
-                text=f"{v:,.2f}",
-                anchor="e",
-                fill="#5E6B85",
-                font=("Segoe UI", 9),
-            )
-
 
         def x_map(s: float) -> float:
             return x0 + (s / total_sec) * (x1 - x0)
 
         def y_map(v: float) -> float:
             return y1 - ((v - ymin) / (ymax - ymin)) * (y1 - y0)
+        
+        
+        # --- Y axis ticks ---
+        for i in range(5):
+            frac = i / 4
+            yy = y1 - frac * (y1 - y0)
+            v = ymin + frac * (ymax - ymin)
+            c.create_text(x0 - 8, yy, text=f"{v:,.0f}", anchor="e", fill="#5E6B85", font=("Segoe UI", 9))
+        
+        # --- X axis hour ticks ---
+        hours = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00", "22:00"]
+        for lab in hours:
+            tmark = pd.Timestamp(f"{day.isoformat()} {lab}:00")
+            if start_dt <= tmark <= end_dt:
+                s = (tmark - start_dt).total_seconds()
+                xx = x_map(s)
+                c.create_line(xx, y1, xx, y1 + 6, fill="#D1E2FF", width=1)
+                c.create_text(xx, y1 + 10, text=lab, fill="#5E6B85", font=("Segoe UI", 8), anchor="n")
 
         c.create_rectangle(x0, y0, x1, y1, outline="#D8E1F0", width=1)
 
-        # light grid: 6 vertical divisions
+        # light grid
         for i in range(7):
             xx = x0 + i * (x1 - x0) / 6
             c.create_line(xx, y0, xx, y1, fill="#EEF3FF")
-        # x-axis labels (08:00 to 22:00, or zoomed window)
-        # Put labels under the plot frame
-        n_ticks = 6  # same as grid divisions
-        for i in range(n_ticks + 1):
-            xx = x0 + i * (x1 - x0) / n_ticks
-            frac = i / n_ticks
-            t_tick = start_dt + pd.Timedelta(seconds=frac * total_sec)
-            c.create_text(
-                xx,
-                y1 + 16,
-                text=t_tick.strftime("%H:%M"),
-                fill="#5E6B85",
-                font=("Segoe UI", 9),
-                anchor="n",
-            )
-            
         for i in range(4):
             yy = y0 + i * (y1 - y0) / 3
             c.create_line(x0, yy, x1, yy, fill="#F3F6FF")
 
-        vals = pd.to_numeric(sub["tradeUnderlyingSpotRef"], errors="coerce").ffill().bfill()
         pts: List[float] = []
-        for ss, vv in zip(secs.tolist(), vals.tolist()):
+        for ss, vv in zip(secs, yvals):
+            if vv is None or pd.isna(vv):
+                continue
             pts.extend([x_map(float(ss)), y_map(float(vv))])
         if len(pts) >= 4:
             c.create_line(*pts, fill="#2E7BFF", width=2)
 
-        c.create_text(
-            x0,
-            y0 - 10,
-            text="Underlying Spot Ref",
-            anchor="w",
-            fill="#0B1220",
-            font=("Segoe UI Semibold", 10),
-        )
+        c.create_text(x0, y0 - 10, text="Underlying Spot Ref", anchor="w", fill="#0B1220", font=("Segoe UI Semibold", 10))
 
-    def _draw_main_plot(
-        self,
-        df: pd.DataFrame,
-        day: date,
-        pnl_cols: List[str],
-        delta_cols: List[str],
-    ) -> List[Tuple[str, str, str]]:
+    def _draw_main_plot(self, df: pd.DataFrame, day: date, pnl_cols: List[str], delta_cols: List[str]) -> List[Tuple[str, str, str]]:
         c = self.canvas_main
         w = max(520, c.winfo_width())
         h = max(280, c.winfo_height())
-    
+
         left, right, top, bottom = 70, 70, 30, 50
         x0, y0 = left, top
         x1, y1 = w - right, h - bottom
-    
+
         start_dt, end_dt = self._get_window(day)
         total_sec = (end_dt - start_dt).total_seconds()
         if total_sec <= 0:
-            self._draw_empty(c, "Bad zoom window.")
+            self._draw_empty(c, "Bad window.")
             return []
-    
-        t = df["tradeTime"]
+
+        t = pd.to_datetime(df["tradeTime"], errors="coerce")
         mask = (t >= start_dt) & (t <= end_dt)
-    
+
         needed = ["tradeTime"] + list(set(pnl_cols + delta_cols))
-        sub = df.loc[mask, [col for col in needed if col in df.columns]].copy()
+        cols = [col for col in needed if col in df.columns]
+        sub = df.loc[mask, cols].copy()
         if sub.empty:
             self._draw_empty(c, "No trades in window.")
             return []
-    
+
         sub.sort_values("tradeTime", inplace=True, kind="mergesort")
-        secs = (sub["tradeTime"] - start_dt).dt.total_seconds().astype("float64")
-    
-        # ---------- symmetric ranges around 0 ----------
-        def max_abs_for(cols: List[str]) -> float:
-            if not cols:
+        secs = (pd.to_datetime(sub["tradeTime"]) - start_dt).dt.total_seconds().astype("float64").tolist()
+
+        def max_abs_for(cols_: List[str]) -> float:
+            if not cols_:
                 return 1.0
-            vals = []
-            for col in cols:
+            s_all = []
+            for col in cols_:
                 if col in sub.columns:
                     s = pd.to_numeric(sub[col], errors="coerce").astype("float64")
-                    vals.append(s)
-            if not vals:
+                    s_all.append(s)
+            if not s_all:
                 return 1.0
-            s_all = pd.concat(vals, axis=0).dropna()
-            if s_all.empty:
+            s_cat = pd.concat(s_all, axis=0).dropna()
+            if s_cat.empty:
                 return 1.0
-            m = float(s_all.abs().max())
-            if not (m > 0):
-                m = 1.0
-            # small padding so lines don't touch frame
-            return m * 1.08
-    
+            m = float(s_cat.abs().max())
+            return max(1.0, m * 1.08)
+
         pnl_maxabs = max_abs_for(pnl_cols)
         d_maxabs = max_abs_for(delta_cols)
-    
+
         pnl_min, pnl_max = -pnl_maxabs, +pnl_maxabs
         d_min, d_max = -d_maxabs, +d_maxabs
-    
+
         def x_map(s: float) -> float:
             return x0 + (s / total_sec) * (x1 - x0)
-    
+
         def y_map_left(v: float) -> float:
-            # pnl range is symmetric around 0
             return y1 - ((v - pnl_min) / (pnl_max - pnl_min)) * (y1 - y0)
-    
+
         def y_map_right(v: float) -> float:
-            # delta range is symmetric around 0
             return y1 - ((v - d_min) / (d_max - d_min)) * (y1 - y0)
-    
-        # Frame
+
         c.create_rectangle(x0, y0, x1, y1, outline="#D8E1F0", width=1)
-    
-        # Grid: 10 vertical, 4 horizontal (plus strong 0-line)
+
         for i in range(11):
             xx = x0 + i * (x1 - x0) / 10
             c.create_line(xx, y0, xx, y1, fill="#EEF3FF")
-    
         for i in range(5):
             yy = y0 + i * (y1 - y0) / 4
             c.create_line(x0, yy, x1, yy, fill="#F3F6FF")
-    
-        # Strong horizontal line at y=0 (center)
-        y_zero = y_map_left(0.0)  # == y_map_right(0.0) due to symmetry
+
+        y_zero = y_map_left(0.0)
         c.create_line(x0, y_zero, x1, y_zero, fill="#B8C7E6", width=2)
-    
-        # Axes labels (left: PnL, right: Delta) — symmetric ticks
+
+        # axis labels (left/right)
         for i in range(5):
             frac = i / 4
             yy = y1 - frac * (y1 - y0)
             vL = pnl_min + frac * (pnl_max - pnl_min)
             vR = d_min + frac * (d_max - d_min)
             c.create_text(x0 - 8, yy, text=f"{vL:,.0f}", anchor="e", fill="#5E6B85", font=("Segoe UI", 9))
-            c.create_text(x1 + 8, yy, text=f"{vR:,.2f}", anchor="w", fill="#5E6B85", font=("Segoe UI", 9))
-    
-        # markers (relative to full day, show if within zoom)
-        full_start = pd.Timestamp(datetime.combine(day, time(8, 0, 0)))
-        full_end = pd.Timestamp(datetime.combine(day, time(22, 0, 0)))
-        self._draw_marker_windowed(c, day, full_start, full_end, start_dt, end_dt, total_sec, x_map, y0, y1)
-    
-        # titles
+            c.create_text(x1 + 8, yy, text=f"{vR:,.4f}", anchor="w", fill="#5E6B85", font=("Segoe UI", 9))
+
+        # time markers
+        full_day = day
+        t1 = pd.Timestamp(f"{full_day.isoformat()} 09:00:00")
+        uo = us_open_berlin(full_day)
+        t2 = pd.Timestamp(f"{full_day.isoformat()} {uo.strftime('%H:%M:%S')}")
+        for tmark, label in [(t1, "09:00"), (t2, f"US open {uo.strftime('%H:%M')}")]:
+            if start_dt <= tmark <= end_dt:
+                s = (tmark - start_dt).total_seconds()
+                xx = x_map(s)
+                c.create_line(xx, y0, xx, y1, fill="#D1E2FF", width=2)
+                c.create_text(xx, y0 - 6, text=label, fill="#2667D6", font=("Segoe UI Semibold", 9), anchor="s")
+
         c.create_text(x0, y0 - 14, text="PnL", anchor="w", fill="#0B1220", font=("Segoe UI Semibold", 10))
         c.create_text(x1, y0 - 14, text="Δ (right)", anchor="e", fill="#0B1220", font=("Segoe UI Semibold", 10))
-    
+
         palette = ["#2E7BFF", "#00B6D6", "#7C3AED", "#16A34A", "#F97316", "#EF4444", "#0EA5E9", "#A855F7"]
         legend_items: List[Tuple[str, str, str]] = []
-    
-        # PnL lines (left axis)
-        for k, colname in enumerate(pnl_cols):
+
+        # draw pnl
+        k0 = 0
+        for colname in pnl_cols:
             if colname not in sub.columns:
                 continue
-            color = palette[k % len(palette)]
+            color = palette[k0 % len(palette)]
+            k0 += 1
             svals = pd.to_numeric(sub[colname], errors="coerce").fillna(0.0).astype("float64").tolist()
+            secs2, svals2 = self._downsample(secs, svals, max_points=1400)
+
             pts: List[float] = []
-            for ss, vv in zip(secs.tolist(), svals):
+            for ss, vv in zip(secs2, svals2):
                 pts.extend([x_map(float(ss)), y_map_left(float(vv))])
             if len(pts) >= 4:
                 c.create_line(*pts, fill=color, width=2)
                 legend_items.append((color, colname, "PnL"))
-    
-        # Delta lines (right axis)
-        offset = len(pnl_cols)
-        for k, colname in enumerate(delta_cols):
+
+        # draw deltas
+        for colname in delta_cols:
             if colname not in sub.columns:
                 continue
-            color = palette[(offset + k) % len(palette)]
+            color = palette[k0 % len(palette)]
+            k0 += 1
             svals = pd.to_numeric(sub[colname], errors="coerce").fillna(0.0).astype("float64").tolist()
+            secs2, svals2 = self._downsample(secs, svals, max_points=1400)
+
             pts: List[float] = []
-            for ss, vv in zip(secs.tolist(), svals):
+            for ss, vv in zip(secs2, svals2):
                 pts.extend([x_map(float(ss)), y_map_right(float(vv))])
             if len(pts) >= 4:
                 c.create_line(*pts, fill=color, width=2)
                 legend_items.append((color, colname, "Δ"))
-    
+
         return legend_items
-
-
-    def _draw_marker_windowed(
-        self,
-        canvas: tk.Canvas,
-        day: date,
-        full_start: pd.Timestamp,
-        full_end: pd.Timestamp,
-        start_dt: pd.Timestamp,
-        end_dt: pd.Timestamp,
-        total_sec: float,
-        x_map,
-        y0: int,
-        y1: int,
-    ) -> None:
-        # 09:00
-        t1 = pd.Timestamp(datetime.combine(day, time(9, 0)))
-        # US open Berlin
-        uo = us_open_berlin(day)
-        t2 = pd.Timestamp(datetime.combine(day, uo))
-
-        for tmark, label in [(t1, "09:00"), (t2, f"US open {uo.strftime('%H:%M')}")]:
-            if not (start_dt <= tmark <= end_dt):
-                continue
-            s = (tmark - start_dt).total_seconds()
-            xx = x_map(s)
-            canvas.create_line(xx, y0, xx, y1, fill="#D1E2FF", width=2)
-            canvas.create_text(xx, y0 - 6, text=label, fill="#2667D6", font=("Segoe UI Semibold", 9), anchor="s")

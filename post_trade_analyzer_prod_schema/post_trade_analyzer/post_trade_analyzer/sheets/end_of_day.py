@@ -1,131 +1,265 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date as DateType
+from typing import Dict, List, Optional
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
 import pandas as pd
 
-from ..utils.table_utils import build_display_cache, sanitize_visible_cols
+from ..utils.table_utils import build_display_cache
 
 
-# ----------------------------
-# EndOfDay Sheet
-# ----------------------------
+# ============================================================
+# Simple autocomplete combobox (fast + robust)
+# ============================================================
+class AutocompleteCombobox(ttk.Combobox):
+    """
+    Simple autocomplete combobox:
+    - keeps a master list of values
+    - filters on KeyRelease
+    - supports empty selection
+    """
+
+    def __init__(self, master, *, values: List[str], **kwargs):
+        super().__init__(master, values=values, **kwargs)
+        self._all_values = list(values)
+        self.bind("<KeyRelease>", self._on_keyrelease)
+
+    def set_values(self, values: List[str]) -> None:
+        self._all_values = list(values)
+        self["values"] = self._all_values
+
+    def _on_keyrelease(self, event) -> None:
+        if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Tab"):
+            return
+        text = self.get().strip().lower()
+        if not text:
+            self["values"] = self._all_values
+            return
+        filtered = [v for v in self._all_values if text in v.lower()]
+        self["values"] = filtered if filtered else self._all_values
+
+
+# ============================================================
+# EndOfDay Sheet (Underlying-only selection)
+# ============================================================
+@dataclass(frozen=True)
+class EODSelection:
+    underlying: str = ""
+
 
 class EndOfDaySheet(ttk.Frame):
     sheet_id = "eod"
     sheet_title = "EndOfDay"
 
-    # Ajusta aquí si quieres limitar/ordenar columnas candidatas
-    PNL_CANDIDATES = [
-        "Total",
-        "PremiaCum",
-        "SpreadsCapture",
-        "FullSpreadCapture",
-        "PnlVonDeltaCum",
-        "feesCum",
-        "AufgeldCum",
-    ]
+    HIST_METRICS = ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung"]
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
 
-        self._df_all: Optional[pd.DataFrame] = None
-        self._df_eod: Optional[pd.DataFrame] = None
+        self._trades: Optional[pd.DataFrame] = None
+        self._adj: Optional[pd.DataFrame] = None
+
+        self._eod: Optional[pd.DataFrame] = None  # last trade per (underlyingName, date)
+        self._sel = EODSelection()
 
         self._build()
 
     def _build(self) -> None:
+        # Top title
         top = ttk.Frame(self)
         top.pack(fill="x", padx=14, pady=(14, 10))
         ttk.Label(top, text="EndOfDay", style="Title.TLabel").pack(side="left")
 
+        # Search panel (Underlying-only)
+        search = ttk.Frame(self)
+        search.pack(fill="x", padx=14, pady=(0, 10))
+
+        ttk.Label(search, text="Underlying", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+
+        self.underlying_var = tk.StringVar()
+        self.underlying_cb = AutocompleteCombobox(
+            search, values=[], textvariable=self.underlying_var, state="normal", width=28
+        )
+        self.underlying_cb.grid(row=1, column=0, sticky="w")
+
+        ttk.Button(search, text="Apply",style="Accent.TButton", command=self._apply_selection).grid(row=1, column=1, padx=(14, 0))
+        ttk.Button(search, text="Clear", command=self._clear_selection).grid(row=1, column=2, padx=(8, 0))
+
+        self.sel_info = tk.StringVar(value="Selected: Underlying=(all)")
+        ttk.Label(search, textvariable=self.sel_info, style="Muted.TLabel").grid(
+            row=1, column=3, sticky="w", padx=(14, 0)
+        )
+
+        # Main notebook
         card = ttk.Frame(self, style="Card.TFrame")
         card.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-
         inner = ttk.Frame(card, style="Card.TFrame")
         inner.pack(fill="both", expand=True, padx=12, pady=12)
 
         self.nb = ttk.Notebook(inner)
         self.nb.pack(fill="both", expand=True)
 
-        self.sub_data = EODDataSubsheet(self.nb)
-        self.sub_plot = EODPlotSubsheet(self.nb, pnl_candidates=self.PNL_CANDIDATES)
+        self.tab_data = EODDataTab(self.nb)
+        self.tab_adj = EODAdjustmentsTab(self.nb)
+        self.tab_plot = EODPlotTab(self.nb, hist_metrics=self.HIST_METRICS)
 
-        self.nb.add(self.sub_data, text="Data")
-        self.nb.add(self.sub_plot, text="Plot")
+        self.nb.add(self.tab_data, text="Data")
+        self.nb.add(self.tab_adj, text="Data II (Anpassung)")
+        self.nb.add(self.tab_plot, text="Plot")
 
-    def on_df_loaded(self, df: pd.DataFrame) -> None:
-        """
-        Called by app when main df is loaded.
-        Builds end-of-day df: last row per (instrument, day).
-        """
-        self._df_all = df
-        self._df_eod = self._build_eod_df(df)
+    # -------------------------
+    # API called by app
+    # -------------------------
+    def on_df_loaded(self, trades: pd.DataFrame) -> None:
+        self._trades = trades
+        self._rebuild_eod_if_possible()
 
-        self.sub_data.set_df(self._df_eod)
-        self.sub_plot.set_df(self._df_eod)
+    def on_adjustment_loaded(self, adj: pd.DataFrame) -> None:
+        self._adj = adj
+        self._rebuild_eod_if_possible()
+
+    # -------------------------
+    # Build EOD core df
+    # -------------------------
+    def _rebuild_eod_if_possible(self) -> None:
+        if self._trades is None:
+            return
+
+        self._eod = self._build_eod_last_trade_per_day_underlying(self._trades)
+
+        # Update underlying list
+        if self._eod is not None and not self._eod.empty:
+            underlyings = sorted(self._eod["underlyingName"].astype(str).dropna().unique().tolist())
+        else:
+            underlyings = []
+
+        self.underlying_cb.set_values(underlyings)
+
+        # Push initial (unfiltered) view
+        self._push_filtered()
 
     @staticmethod
-    def _build_eod_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def _build_eod_last_trade_per_day_underlying(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Last row per (underlyingName, date) using idxmax(tradeTime).
+        Assumes df has columns: underlyingName, date, tradeTime (date derived already).
+        """
         if df is None or df.empty:
-            return None
-        if "instrument" not in df.columns or "tradeTime" not in df.columns:
-            return None
+            return pd.DataFrame()
+        if "underlyingName" not in df.columns or "date" not in df.columns or "tradeTime" not in df.columns:
+            return pd.DataFrame()
 
-        tmp = df.copy()
-        # day column (date)
-        tmp["_day"] = tmp["tradeTime"].dt.date
-        # sort so "last row" is last by tradeTime
-        tmp.sort_values(["instrument", "_day", "tradeTime"], inplace=True, kind="mergesort")
-        # last row per instrument/day
-        eod = tmp.groupby(["instrument", "_day"], sort=False, as_index=False).tail(1).copy()
-        # for nicer usage in plot and table
-        eod.rename(columns={"_day": "day"}, inplace=True)
-        eod.reset_index(drop=True, inplace=True)
-        return eod
+        tt = pd.to_datetime(df["tradeTime"], errors="coerce")
+        helper = pd.DataFrame(
+            {"underlyingName": df["underlyingName"], "date": df["date"], "_tt": tt}
+        ).dropna(subset=["underlyingName", "date", "_tt"])
+
+        if helper.empty:
+            return pd.DataFrame()
+
+        idx = helper.groupby(["underlyingName", "date"], sort=False)["_tt"].idxmax()
+        out = df.loc[idx].copy()
+        out.reset_index(drop=True, inplace=True)
+        return out
+
+    # -------------------------
+    # Selection / filtering
+    # -------------------------
+    def _apply_selection(self) -> None:
+        u = self.underlying_var.get().strip()
+        self._sel = EODSelection(underlying=u)
+        self._push_filtered()
+
+    def _clear_selection(self) -> None:
+        self.underlying_var.set("")
+        self._sel = EODSelection()
+        self._push_filtered()
+
+    def _push_filtered(self) -> None:
+        eod = self._eod
+        if eod is None or eod.empty:
+            self.sel_info.set("Selected: Underlying=(all) — no data")
+            self.tab_data.set_df(pd.DataFrame())
+            self.tab_adj.set_df(pd.DataFrame())
+            self.tab_plot.set_data(pd.DataFrame(), pd.DataFrame())
+            return
+
+        df = eod
+        if self._sel.underlying:
+            df = df[df["underlyingName"].astype(str) == self._sel.underlying]
+
+        df = df.reset_index(drop=True)
+
+        # Selected label
+        if self._sel.underlying:
+            self.sel_info.set(f"Selected: Underlying={self._sel.underlying}")
+        else:
+            self.sel_info.set("Selected: Underlying=(all)")
+
+        # Data tab
+        self.tab_data.set_df(df)
+
+        # Adjustments tab (filtered by underlying + matching dates)
+        adj_view = self._filter_adjustments_for_selection(df)
+        self.tab_adj.set_df(adj_view)
+
+        # Plot tab gets both
+        self.tab_plot.set_data(df, adj_view)
+
+    def _filter_adjustments_for_selection(self, df_eod_filtered: pd.DataFrame) -> pd.DataFrame:
+        adj = self._adj
+        if adj is None or adj.empty:
+            return pd.DataFrame(columns=["underlyingName", "date", "Anpassung"])
+
+        out = adj.copy()
+        if "underlyingName" not in out.columns and "underlying" in out.columns:
+            out = out.rename(columns={"underlying": "underlyingName"})
+
+        if self._sel.underlying:
+            out = out[out["underlyingName"].astype(str) == self._sel.underlying]
+
+        if df_eod_filtered is not None and not df_eod_filtered.empty and "date" in df_eod_filtered.columns:
+            dates = set(df_eod_filtered["date"].dropna().tolist())
+            out = out[out["date"].isin(dates)]
+
+        sort_cols = [c for c in ["date", "underlyingName"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+        return out
 
 
-# ----------------------------
-# Data subsheet: table + columns + sorting
-# ----------------------------
-
-class EODDataSubsheet(ttk.Frame):
+# ============================================================
+# Data tab (sortable table, fast)
+# ============================================================
+class EODDataTab(ttk.Frame):
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
 
-        self._df: Optional[pd.DataFrame] = None
-        self._df_view: Optional[pd.DataFrame] = None
-
-        self._sort_col: Optional[str] = None
-        self._sort_asc: bool = True
-
-        self._visible_cols: Optional[List[str]] = None
-        self._rendered_cols: List[str] = []
+        self._df: pd.DataFrame = pd.DataFrame()
+        self._df_view: pd.DataFrame = pd.DataFrame()
 
         self._cache: Dict[str, List[str]] = {}
         self._cache_len: int = 0
 
-        self._resize_after_id: Optional[str] = None
+        self._sort_col: Optional[str] = None
+        self._sort_asc: bool = True
 
+        self.info_var = tk.StringVar(value="No rows.")
         self._build()
 
     def _build(self) -> None:
-        controls = ttk.Frame(self)
-        controls.pack(fill="x", padx=10, pady=(10, 8))
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 8))
+        ttk.Label(top, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
 
-        ttk.Button(controls, text="Columns", command=self._open_columns_dialog_fast).pack(side="left")
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        self.info_var = tk.StringVar(value="No data.")
-        ttk.Label(controls, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
-
-        tcard = ttk.Frame(self, style="Card.TFrame")
-        tcard.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        inner = ttk.Frame(tcard, style="Card.TFrame")
+        inner = ttk.Frame(card, style="Card.TFrame")
         inner.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.tree = ttk.Treeview(inner, style="Futur.Treeview", show="headings")
@@ -136,60 +270,45 @@ class EODDataSubsheet(ttk.Frame):
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.vsb.grid(row=0, column=1, sticky="ns")
         self.hsb.grid(row=1, column=0, sticky="ew")
-
         inner.rowconfigure(0, weight=1)
         inner.columnconfigure(0, weight=1)
 
         self.tree.tag_configure("odd", background="#FFFFFF")
         self.tree.tag_configure("even", background="#F8FAFF")
 
-        self.tree.bind("<Configure>", self._on_tree_configure)
+        # PERF: no resize bindings, no autofit, stretch=False
 
-    def set_df(self, df: Optional[pd.DataFrame]) -> None:
-        self._df = df
-        self._df_view = df
+    def set_df(self, df: pd.DataFrame) -> None:
+        self._df = df if df is not None else pd.DataFrame()
+        self._df_view = self._df
         self._sort_col = None
         self._sort_asc = True
 
-        if df is None or df.empty:
-            self.info_var.set("No rows.")
-            self._clear_tree()
-            self._visible_cols = None
-            self._cache.clear()
-            self._cache_len = 0
-            return
+        n = len(self._df_view)
+        self.info_var.set(f"{n:,} rows (EOD last trade per day & underlying)")
 
-        self.info_var.set(f"{len(df):,} end-of-day rows")
+        self._cache, self._cache_len = build_display_cache(self._df_view)
+        self._render()
 
-        if self._visible_cols is None:
-            self._visible_cols = list(df.columns)
-
-        self._cache, self._cache_len = build_display_cache(df)
-        self._render_from_cache()
-
-    def _render_from_cache(self) -> None:
+    def _render(self) -> None:
+        self.tree.delete(*self.tree.get_children())
         df = self._df_view
         if df is None or df.empty:
-            self._clear_tree()
+            self.tree["columns"] = []
             return
 
-        cols = sanitize_visible_cols(list(df.columns), self._visible_cols)
-        self._rendered_cols = cols
-
-        self._clear_tree()
-
+        cols = list(df.columns)
         self.tree["columns"] = cols
+
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=True)
+            self.tree.column(c, width=110, minwidth=80, anchor="c", stretch=False)
 
         cache = self._cache
         for i in range(self._cache_len):
             values = [cache[c][i] for c in cols]
             tag = "even" if (i % 2 == 0) else "odd"
             self.tree.insert("", "end", values=values, tags=(tag,))
-
-        self._autofit_from_cache(sample_rows=min(200, self._cache_len))
 
     def _sort_by(self, col: str) -> None:
         df = self._df
@@ -202,569 +321,505 @@ class EODDataSubsheet(ttk.Frame):
             self._sort_col = col
             self._sort_asc = True
 
-        view = df
         try:
             view = df.sort_values(by=col, ascending=self._sort_asc, kind="mergesort")
         except Exception:
             view = (
-                df.assign(_tmp=df[col].astype("string"))
+                df.assign(_tmp=df[col].astype(str))
                 .sort_values(by="_tmp", ascending=self._sort_asc, kind="mergesort")
                 .drop(columns="_tmp")
             )
 
-        view = view.reset_index(drop=True)
-        self._df_view = view
-
-        self._cache, self._cache_len = build_display_cache(view)
-        self._render_from_cache()
-
-    def _clear_tree(self) -> None:
-        self.tree.delete(*self.tree.get_children())
-        self.tree["columns"] = []
-
-    def _on_tree_configure(self, _event) -> None:
-        if self._resize_after_id is not None:
-            try:
-                self.after_cancel(self._resize_after_id)
-            except Exception:
-                pass
-        self._resize_after_id = self.after(180, lambda: self._autofit_from_cache(sample_rows=140))
-
-    def _autofit_from_cache(self, sample_rows: int = 500) -> None:
-        if not self._rendered_cols or self._cache_len == 0:
-            return
-    
-        import tkinter.font as tkfont
-        body_font = tkfont.nametofont("TkDefaultFont")
-        heading_font = tkfont.Font(
-            family=body_font.actual("family"),
-            size=body_font.actual("size"),
-            weight="bold",
-        )
-    
-        pad = 34
-        n = min(sample_rows, self._cache_len)
-        cache = self._cache
-    
-        widths = {}
-        for c in self._rendered_cols:
-            w = heading_font.measure(c) + pad
-            col_vals = cache.get(c, [])
-            for i in range(n):
-                ww = body_font.measure(col_vals[i]) + pad
-                if ww > w:
-                    w = ww
-            widths[c] = w
-    
-        for c in self._rendered_cols:
-            self.tree.column(c, width=widths[c], stretch=False)
-
-    def _open_columns_dialog_fast(self) -> None:
-        df = self._df
-        if df is None or df.empty:
-            messagebox.showinfo("Columns", "No data to show.")
-            return
-
-        all_cols = list(df.columns)
-        visible_set = set(self._visible_cols or all_cols)
-
-        win = tk.Toplevel(self)
-        win.title("Select columns")
-        win.geometry("420x520")
-        win.configure(bg="#F5F7FB")
-        win.transient(self.winfo_toplevel())
-        win.grab_set()
-
-        header = ttk.Frame(win)
-        header.pack(fill="x", padx=12, pady=(12, 8))
-        ttk.Label(header, text="Columns", style="Title.TLabel").pack(side="left")
-
-        search_frame = ttk.Frame(win)
-        search_frame.pack(fill="x", padx=12, pady=(0, 8))
-        ttk.Label(search_frame, text="Search", style="Muted.TLabel").pack(side="left")
-        q_var = tk.StringVar()
-        q_entry = ttk.Entry(search_frame, textvariable=q_var)
-        q_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=12, pady=(0, 8))
-
-        outer = ttk.Frame(win)
-        outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-
-        lb = tk.Listbox(outer, selectmode="extended", activestyle="none", exportselection=False, height=20)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=lb.yview)
-        lb.configure(yscrollcommand=sb.set)
-        lb.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        filtered_cols: List[str] = []
-
-        def repopulate() -> None:
-            nonlocal filtered_cols
-            q = q_var.get().strip().lower()
-            filtered_cols = [c for c in all_cols if (q in c.lower())] if q else all_cols[:]
-            lb.delete(0, "end")
-            for c in filtered_cols:
-                lb.insert("end", c)
-            for i, c in enumerate(filtered_cols):
-                if c in visible_set:
-                    lb.selection_set(i)
-
-        def select_all() -> None:
-            for i in range(len(filtered_cols)):
-                lb.selection_set(i)
-
-        def select_none() -> None:
-            lb.selection_clear(0, "end")
-
-        ttk.Button(btns, text="Select all (filtered)", command=select_all).pack(side="left")
-        ttk.Button(btns, text="Select none (filtered)", command=select_none).pack(side="left", padx=8)
-
-        q_var.trace_add("write", lambda *_: repopulate())
-        repopulate()
-
-        footer = ttk.Frame(win)
-        footer.pack(fill="x", padx=12, pady=(0, 12))
-
-        def apply_and_close() -> None:
-            sel = set(filtered_cols[i] for i in lb.curselection())
-            q = q_var.get().strip().lower()
-            if q:
-                for c in filtered_cols:
-                    visible_set.discard(c)
-                visible_set.update(sel)
-            else:
-                visible_set.clear()
-                visible_set.update(sel)
-
-            if not visible_set:
-                messagebox.showwarning("Columns", "Select at least one column.")
-                return
-
-            self._visible_cols = [c for c in all_cols if c in visible_set]
-            self._df_view = self._df  # reset view
-            self._cache, self._cache_len = build_display_cache(self._df_view)
-            self._render_from_cache()
-            win.destroy()
-
-        ttk.Button(footer, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(footer, text="Apply", style="Accent.TButton", command=apply_and_close).pack(side="right", padx=8)
-
-        q_entry.focus_set()
+        self._df_view = view.reset_index(drop=True)
+        self._cache, self._cache_len = build_display_cache(self._df_view)
+        self._render()
 
 
-# ----------------------------
-# Plot subsheet: separated histogram + cumulative
-# ----------------------------
-class EODPlotSubsheet(ttk.Frame):
-    def __init__(self, master: tk.Misc, pnl_candidates: List[str]) -> None:
+# ============================================================
+# Adjustments tab (sortable table, simple)
+# ============================================================
+class EODAdjustmentsTab(ttk.Frame):
+    def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
 
-        self._df: Optional[pd.DataFrame] = None
-        self._df_inst: Optional[pd.DataFrame] = None
+        self._df: pd.DataFrame = pd.DataFrame()
+        self._df_view: pd.DataFrame = pd.DataFrame()
 
-        self.pnl_candidates = pnl_candidates
+        self._cache: Dict[str, List[str]] = {}
+        self._cache_len: int = 0
 
-        self.instrument_var = tk.StringVar()
-        self.bar_var = tk.StringVar()
-        self.normalize_var = tk.BooleanVar(value=False)
+        self._sort_col: Optional[str] = None
+        self._sort_asc: bool = True
 
-        self._redraw_after_id: Optional[str] = None
+        self.info_var = tk.StringVar(value="No rows.")
+        self._build()
 
-        # tooltip state (hist)
-        self._hist_geom = None  # (x0, x1, y0, y1, slot)
-        self._hist_days = None
-        self._hist_vals = None
+    def _build(self) -> None:
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 8))
+        ttk.Label(top, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
+
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        inner = ttk.Frame(card, style="Card.TFrame")
+        inner.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tree = ttk.Treeview(inner, style="Futur.Treeview", show="headings")
+        self.vsb = ttk.Scrollbar(inner, orient="vertical", command=self.tree.yview)
+        self.hsb = ttk.Scrollbar(inner, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+        self.hsb.grid(row=1, column=0, sticky="ew")
+        inner.rowconfigure(0, weight=1)
+        inner.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("odd", background="#FFFFFF")
+        self.tree.tag_configure("even", background="#F8FAFF")
+
+    def set_df(self, df: pd.DataFrame) -> None:
+        self._df = df if df is not None else pd.DataFrame()
+        self._df_view = self._df
+        self._sort_col = None
+        self._sort_asc = True
+
+        n = len(self._df_view)
+        self.info_var.set(f"{n:,} rows (Anpassung)")
+
+        self._cache, self._cache_len = build_display_cache(self._df_view)
+        self._render()
+
+    def _render(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        df = self._df_view
+        if df is None or df.empty:
+            self.tree["columns"] = []
+            return
+
+        cols = list(df.columns)
+        self.tree["columns"] = cols
+
+        for c in cols:
+            self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
+            self.tree.column(c, width=140 if c != "Anpassung" else 120, minwidth=80, anchor="c", stretch=False)
+
+        cache = self._cache
+        for i in range(self._cache_len):
+            values = [cache[c][i] for c in cols]
+            tag = "even" if (i % 2 == 0) else "odd"
+            self.tree.insert("", "end", values=values, tags=(tag,))
+
+    def _sort_by(self, col: str) -> None:
+        df = self._df
+        if df is None or df.empty:
+            return
+
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+
+        try:
+            view = df.sort_values(by=col, ascending=self._sort_asc, kind="mergesort")
+        except Exception:
+            view = (
+                df.assign(_tmp=df[col].astype(str))
+                .sort_values(by="_tmp", ascending=self._sort_asc, kind="mergesort")
+                .drop(columns="_tmp")
+            )
+
+        self._df_view = view.reset_index(drop=True)
+        self._cache, self._cache_len = build_display_cache(self._df_view)
+        self._render()
+
+
+# ============================================================
+# Plot tab — CEO single canvas (cumulative lines + daily bars)
+#   - Y axes with ticks
+#   - highlighted zero line
+#   - dynamic left padding so big labels don't clip
+#   - variable toggles + redraw
+#   - hover tooltip on bars
+# ============================================================
+class EODPlotTab(ttk.Frame):
+    PNL_NAME = "PnL (Anpassung+Total)"
+
+    def __init__(self, master: tk.Misc, hist_metrics: List[str]) -> None:
+        super().__init__(master)
+
+        self._eod: pd.DataFrame = pd.DataFrame()
+        self._adj: pd.DataFrame = pd.DataFrame()
+
+        base = [v for v in ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung"] if v in hist_metrics]
+        if not base:
+            base = hist_metrics[:]
+
+        # ensure derived PnL present
+        self._vars = base + [self.PNL_NAME]
+
+        self._var_enabled: Dict[str, tk.BooleanVar] = {v: tk.BooleanVar(value=True) for v in self._vars}
+
+        self._daily: pd.DataFrame = pd.DataFrame()
+
+        # Hover geometry caches
+        self._bar_hits: List[Dict[str, object]] = []
+        self._tooltip: Optional[tk.Toplevel] = None
 
         self._build()
 
-    # ------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------
-
     def _build(self) -> None:
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True, padx=10, pady=10)
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="both", expand=True, padx=10, pady=10)
 
-        left = ttk.Frame(root, style="Card.TFrame")
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
-        left.configure(width=340)
-        left.grid_propagate(False)
+        top = ttk.Frame(card, style="Card.TFrame")
+        top.pack(fill="x", padx=10, pady=(10, 6))
 
-        right = ttk.Frame(root, style="Card.TFrame")
-        right.grid(row=0, column=1, sticky="nsew")
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
+        ttk.Button(top, text="Redraw", command=self.redraw).pack(side="left")
 
-        pad = ttk.Frame(left, style="Card.TFrame")
-        pad.pack(fill="both", expand=True, padx=12, pady=12)
+        chk = ttk.Frame(top)
+        chk.pack(side="left", padx=(12, 0))
+        for v in self._vars:
+            ttk.Checkbutton(chk, text=v, variable=self._var_enabled[v], command=self.redraw).pack(
+                side="left", padx=(0, 10)
+            )
 
-        ttk.Label(pad, text="Instrument", style="Muted.TLabel").pack(anchor="w")
-        self.instrument_cb = ttk.Combobox(pad, textvariable=self.instrument_var, state="readonly")
-        self.instrument_cb.pack(fill="x", pady=(6, 12))
-        self.instrument_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_instrument())
+        self.info_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
 
-        ttk.Label(pad, text="Histogram variable", style="Muted.TLabel").pack(anchor="w")
-        self.bar_cb = ttk.Combobox(pad, textvariable=self.bar_var, state="readonly")
-        self.bar_cb.pack(fill="x", pady=(6, 12))
-        self.bar_cb.bind("<<ComboboxSelected>>", lambda e: self._schedule_redraw(1))
+        self.canvas = tk.Canvas(card, bg="white", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        ttk.Checkbutton(
-            pad, text="Normalize cumulative", variable=self.normalize_var,
-            command=lambda: self._schedule_redraw(1)
-        ).pack(anchor="w", pady=(4, 12))
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", lambda e: self._hide_tooltip())
 
-        ttk.Label(pad, text="Cumulative lines", style="Muted.TLabel").pack(anchor="w")
-        self.lines_lb = tk.Listbox(
-            pad, selectmode="extended", activestyle="none", exportselection=False, height=10
-        )
-        self.lines_lb.pack(fill="x", pady=(6, 12))
+        # PERF: no redraw-on-resize bindings
 
-        ttk.Button(pad, text="Redraw", style="Accent.TButton", command=self.redraw).pack(anchor="w")
-
-        # Legend under Redraw
-        ttk.Separator(pad, orient="horizontal").pack(fill="x", pady=(12, 8))
-        ttk.Label(pad, text="Cumulative legend", style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
-        self.legend_frame = ttk.Frame(pad)
-        self.legend_frame.pack(fill="x")
-
-        # Plots
-        right.rowconfigure(0, weight=2)  # histogram
-        right.rowconfigure(1, weight=3)  # cumulative
-        right.columnconfigure(0, weight=1)
-
-        self.canvas_hist = tk.Canvas(right, bg="#FFFFFF", highlightthickness=0)
-        self.canvas_hist.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
-
-        self.canvas_cum = tk.Canvas(right, bg="#FFFFFF", highlightthickness=0)
-        self.canvas_cum.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-
-        # Tooltip (single lightweight label)
-        self.tooltip = ttk.Label(
-            self.canvas_hist,
-            background="#0F172A",
-            foreground="white",
-            padding=(6, 3),
-            font=("Segoe UI", 9),
-        )
-        self.tooltip.place_forget()
-
-        self.canvas_hist.bind("<Motion>", self._on_hist_motion)
-        self.canvas_hist.bind("<Leave>", lambda e: self.tooltip.place_forget())
-
-        self.canvas_hist.bind("<Configure>", lambda e: self._schedule_redraw(120))
-        self.canvas_cum.bind("<Configure>", lambda e: self._schedule_redraw(120))
-
-    # ------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------
-
-    def set_df(self, df: Optional[pd.DataFrame]) -> None:
-        self._df = df
-        if df is None or df.empty:
-            return
-
-        inst = sorted([x for x in df["instrument"].dropna().astype("string").unique().tolist() if x])
-        self.instrument_cb["values"] = inst
-        self.instrument_var.set(inst[0] if inst else "")
-
-        bars = [c for c in self.pnl_candidates if c in df.columns]
-        if not bars:
-            bars = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])][:10]
-
-        self.bar_cb["values"] = bars
-        self.bar_var.set(bars[0] if bars else "")
-
-        self.lines_lb.delete(0, "end")
-        for c in bars:
-            self.lines_lb.insert("end", c)
-        if bars:
-            self.lines_lb.selection_set(0)
-
-        self._apply_instrument()
-
-    def _apply_instrument(self) -> None:
-        df = self._df
-        if df is None or df.empty:
-            self._df_inst = None
-            self.redraw()
-            return
-
-        inst = self.instrument_var.get().strip()
-        sub = df[df["instrument"].astype("string") == inst].copy()
-        sub.sort_values("day", inplace=True, kind="mergesort")
-        self._df_inst = sub.reset_index(drop=True)
+    # API
+    def set_data(self, eod_filtered: pd.DataFrame, adj_filtered: pd.DataFrame) -> None:
+        self._eod = eod_filtered if eod_filtered is not None else pd.DataFrame()
+        self._adj = adj_filtered if adj_filtered is not None else pd.DataFrame()
+        self._daily = self._build_daily_frame()
         self.redraw()
 
-    # ------------------------------------------------------------
-    # Redraw (debounced)
-    # ------------------------------------------------------------
+    def _enabled_vars(self) -> List[str]:
+        out = [v for v in self._vars if self._var_enabled[v].get()]
+        return out if out else [self._vars[0]]
 
-    def _schedule_redraw(self, delay_ms: int) -> None:
-        if self._redraw_after_id is not None:
+    # Data prep: aggregate per date + merge adjustments
+    def _build_daily_frame(self) -> pd.DataFrame:
+        eod = self._eod
+        if eod is None or eod.empty:
+            return pd.DataFrame()
+
+        need = ["date", "PremiaCum", "PnLVonDeltaCum", "feesCum", "Total"]
+        for c in need:
+            if c not in eod.columns:
+                return pd.DataFrame()
+
+        tmp = pd.DataFrame(
+            {
+                "date": eod["date"],
+                "PremiaCum": pd.to_numeric(eod["PremiaCum"], errors="coerce").fillna(0.0),
+                "PnLVonDeltaCum": pd.to_numeric(eod["PnLVonDeltaCum"], errors="coerce").fillna(0.0),
+                "feesCum": pd.to_numeric(eod["feesCum"], errors="coerce").fillna(0.0),
+                "Total": pd.to_numeric(eod["Total"], errors="coerce").fillna(0.0),
+            }
+        ).dropna(subset=["date"])
+
+        day = (
+            tmp.groupby("date", sort=False, as_index=False)[["PremiaCum", "PnLVonDeltaCum", "feesCum", "Total"]].sum()
+        )
+        day = day.sort_values("date", kind="mergesort").reset_index(drop=True)
+
+        # Merge adjustments by date (already filtered by underlying upstream)
+        adj = self._adj
+        if adj is not None and not adj.empty and "date" in adj.columns and "Anpassung" in adj.columns:
+            a = adj.copy()
+            a["Anpassung"] = pd.to_numeric(a["Anpassung"], errors="coerce").fillna(0.0)
+            a_day = a.groupby("date", sort=False, as_index=False)[["Anpassung"]].sum()
+            out = day.merge(a_day, on="date", how="left")
+            out["Anpassung"] = out["Anpassung"].fillna(0.0)
+        else:
+            out = day.copy()
+            out["Anpassung"] = 0.0
+
+        # Derived PnL
+        out[self.PNL_NAME] = out["Total"] + out["Anpassung"]
+        return out
+
+    # Drawing
+    def redraw(self) -> None:
+        import math
+
+        c = self.canvas
+        c.delete("all")
+        self._bar_hits = []
+
+        df = self._daily
+        if df is None or df.empty:
+            self.info_var.set("No data.")
+            return
+
+        enabled = self._enabled_vars()
+
+        # Downsample days to keep canvas fast
+        max_days = 240
+        if len(df) > max_days:
+            idx = pd.Series(range(len(df)))
+            pick = (idx * (len(df) - 1) // (max_days - 1)).drop_duplicates().astype(int).tolist()
+            df = df.iloc[pick].reset_index(drop=True)
+
+        # Working frame with derived PnL guaranteed
+        df_work = df.copy()
+        if self.PNL_NAME not in df_work.columns:
+            if "Total" in df_work.columns and "Anpassung" in df_work.columns:
+                df_work[self.PNL_NAME] = (
+                    pd.to_numeric(df_work["Total"], errors="coerce").fillna(0.0)
+                    + pd.to_numeric(df_work["Anpassung"], errors="coerce").fillna(0.0)
+                )
+            else:
+                df_work[self.PNL_NAME] = 0.0
+
+        days = df_work["date"].astype(str).tolist()
+        n = len(days)
+
+        # Build daily series and cumulatives
+        daily_vals: Dict[str, List[float]] = {}
+        cum_vals: Dict[str, List[float]] = {}
+
+        for v in enabled:
+            if v not in df_work.columns:
+                daily_vals[v] = [0.0] * len(df_work)
+            else:
+                daily_vals[v] = pd.to_numeric(df_work[v], errors="coerce").fillna(0.0).astype(float).tolist()
+
+            s = 0.0
+            cv = []
+            for x in daily_vals[v]:
+                s += float(x)
+                cv.append(s)
+            cum_vals[v] = cv
+
+        # Canvas size
+        w = max(1, c.winfo_width())
+        h = max(1, c.winfo_height())
+
+        # Determine scales
+        all_cum = [v for k in enabled for v in cum_vals[k]]
+        all_daily = [v for k in enabled for v in daily_vals[k]]
+        vmax = max(1e-9, max(abs(v) for v in all_cum)) if all_cum else 1.0
+        vmaxb = max(1e-9, max(abs(v) for v in all_daily)) if all_daily else 1.0
+
+        # Dynamic left padding for big Y labels (prevents clipping)
+        max_label = max(vmax, vmaxb)
+        digits = int(math.log10(max_label)) + 1 if max_label >= 1 else 1
+        pad_l = max(54, 18 + digits * 9)
+
+        pad_r = 16
+        pad_t = 16
+        pad_b = 28
+
+        split = 0.60
+        y_split = int(pad_t + (h - pad_t - pad_b) * split)
+
+        x0, x1 = pad_l, w - pad_r
+        y0_top, y1_top = pad_t, y_split - 10
+        y0_bot, y1_bot = y_split + 10, h - pad_b
+
+        if x1 <= x0 + 50 or y1_bot <= y0_top + 50:
+            self.info_var.set("Canvas too small.")
+            return
+
+        # Frames
+        c.create_rectangle(x0, y0_top, x1, y1_top, outline="#DDE3F0")
+        c.create_rectangle(x0, y0_bot, x1, y1_bot, outline="#DDE3F0")
+
+        slot = (x1 - x0) / max(1, n)
+
+        def x_at(i: int) -> float:
+            return x0 + slot * (i + 0.5)
+
+        mid_top = (y0_top + y1_top) / 2
+        mid_bot = (y0_bot + y1_bot) / 2
+
+        def y_top(v: float) -> float:
+            return mid_top - (v / vmax) * (y1_top - y0_top) * 0.45
+
+        def y_bot(v: float) -> float:
+            return mid_bot - (v / vmaxb) * (y1_bot - y0_bot) * 0.45
+
+        # Helpers: nice ticks + y axis
+        def nice_step(v: float) -> float:
+            if v <= 0:
+                return 1.0
+            exp = math.floor(math.log10(v))
+            f = v / (10**exp)
+            if f <= 1:
+                nf = 1
+            elif f <= 2:
+                nf = 2
+            elif f <= 5:
+                nf = 5
+            else:
+                nf = 10
+            return nf * (10**exp)
+
+        def draw_y_axis(x_axis: float, y_top_px: float, y_bot_px: float, vmax_abs: float, map_y):
+            c.create_line(x_axis, y_top_px, x_axis, y_bot_px, fill="#E5E7EB")
+            vmax_abs = max(1e-9, float(vmax_abs))
+            step = nice_step(vmax_abs / 4.0)
+            k = int(vmax_abs // step) + 1
+            k = min(k, 6)
+            ticks = [i * step for i in range(-k, k + 1)]
+            for t in ticks:
+                if abs(t) > vmax_abs * 1.001:
+                    continue
+                y = map_y(t)
+                c.create_line(x_axis - 5, y, x_axis, y, fill="#E5E7EB")
+                c.create_text(
+                    x_axis - 8,
+                    y,
+                    text=f"{t:,.0f}",
+                    anchor="e",
+                    fill="#6B7280",
+                    font=("TkDefaultFont", 8),
+                )
+
+        draw_y_axis(x0, y0_top, y1_top, vmax, y_top)
+        draw_y_axis(x0, y0_bot, y1_bot, vmaxb, y_bot)
+
+        # Zero lines (highlighted)
+        c.create_line(x0, mid_top, x1, mid_top, fill="#CBD5E1", width=2)
+        c.create_line(x0, mid_bot, x1, mid_bot, fill="#CBD5E1", width=2)
+
+        # Colors (CEO style)
+        color_map = {
+            "PremiaCum": "#4A6CF7",         # blue
+            "PnLVonDeltaCum": "#111827",    # near black
+            "feesCum": "#F97316",           # orange
+            "Total": "#7C3AED",             # purple
+            "Anpassung": "#10B981",         # green
+            self.PNL_NAME: "#0EA5E9",       # cyan
+        }
+
+        # TOP: cumulative lines
+        for v in enabled:
+            pts: List[float] = []
+            series = cum_vals[v]
+            for i in range(n):
+                pts.extend([x_at(i), y_top(series[i])])
+            if len(pts) >= 4:
+                c.create_line(*pts, fill=color_map.get(v, "#111827"), width=2)
+
+        # Right-side final values
+        y_text = y0_top + 10
+        c.create_text(
+            x1 - 6, y0_top - 2, text="Final (cum)", anchor="ne", fill="#6B7280", font=("TkDefaultFont", 9)
+        )
+        for v in enabled:
+            final = cum_vals[v][-1] if cum_vals[v] else 0.0
+            c.create_text(
+                x1 - 6,
+                y_text,
+                text=f"{v}: {final:,.2f}",
+                anchor="ne",
+                fill=color_map.get(v, "#111827"),
+                font=("TkDefaultFont", 9, "bold"),
+            )
+            y_text += 16
+
+        # BOTTOM: per-day grouped bars (green/red by sign)
+        group_w = slot * 0.80
+        k = len(enabled)
+        bar_w = max(1.0, group_w / (k + 1.0))
+
+        for i in range(n):
+            cx = x_at(i)
+            start = cx - group_w / 2
+            for j, v in enumerate(enabled):
+                val = daily_vals[v][i]
+                bx0 = start + j * bar_w
+                bx1 = bx0 + bar_w * 0.90
+
+                yv = y_bot(val)
+                if val >= 0:
+                    y_top_bar, y_bot_bar = yv, mid_bot
+                    fill = "#10B981"
+                else:
+                    y_top_bar, y_bot_bar = mid_bot, yv
+                    fill = "#EF4444"
+
+                c.create_rectangle(bx0, y_top_bar, bx1, y_bot_bar, outline="", fill=fill)
+
+                self._bar_hits.append(
+                    {
+                        "x0": float(bx0),
+                        "x1": float(bx1),
+                        "y0": float(min(y_top_bar, y_bot_bar)),
+                        "y1": float(max(y_top_bar, y_bot_bar)),
+                        "date": days[i],
+                        "var": v,
+                        "value": float(val),
+                        "cum": float(cum_vals[v][i]),
+                    }
+                )
+
+        # X ticks
+        step = max(1, n // 8)
+        for i in range(0, n, step):
+            c.create_text(
+                x_at(i), h - pad_b + 8, text=days[i], fill="#6B7280", font=("TkDefaultFont", 8), anchor="n"
+            )
+
+        # Titles
+        c.create_text(
+            x0, y0_top - 2, text="Cumulative lines (daily cumsum)", anchor="nw",
+            fill="#111827", font=("TkDefaultFont", 10, "bold")
+        )
+        c.create_text(
+            x0, y0_bot - 2, text="Daily bars (green pos / red neg)", anchor="nw",
+            fill="#111827", font=("TkDefaultFont", 10, "bold")
+        )
+
+        self.info_var.set(f"{len(days)} days | vars: {', '.join(enabled)}")
+
+    # Hover tooltip
+    def _on_motion(self, event) -> None:
+        x, y = event.x, event.y
+        hit = None
+        for item in reversed(self._bar_hits):
+            if item["x0"] <= x <= item["x1"] and item["y0"] <= y <= item["y1"]:
+                hit = item
+                break
+
+        if hit is None:
+            self._hide_tooltip()
+            return
+
+        date_s = str(hit["date"])
+        var = str(hit["var"])
+        val = float(hit["value"])
+        cum = float(hit["cum"])
+
+        txt = f"{date_s}\n{var}: {val:,.2f}\n{var} (cum): {cum:,.2f}"
+        self._show_tooltip(event.x_root + 12, event.y_root + 12, txt)
+
+    def _show_tooltip(self, x: int, y: int, text: str) -> None:
+        self._hide_tooltip()
+        tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(tw, text=text, style="Tooltip.TLabel")
+        label.pack(ipadx=8, ipady=6)
+        self._tooltip = tw
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip is not None:
             try:
-                self.after_cancel(self._redraw_after_id)
+                self._tooltip.destroy()
             except Exception:
                 pass
-        self._redraw_after_id = self.after(delay_ms, self.redraw)
-
-    def redraw(self) -> None:
-        self._redraw_after_id = None
-        self.canvas_hist.delete("all")
-        self.canvas_cum.delete("all")
-        for w in self.legend_frame.winfo_children():
-            w.destroy()
-
-        df = self._df_inst
-        if df is None or df.empty:
-            self._draw_empty(self.canvas_hist, "No data.")
-            self._draw_empty(self.canvas_cum, "No data.")
-            return
-
-        days = df["day"].tolist()
-        bar_col = self.bar_var.get().strip()
-        if bar_col not in df.columns:
-            self._draw_empty(self.canvas_hist, "Missing histogram column.")
-            self._draw_empty(self.canvas_cum, "Select cumulative lines.")
-            return
-
-        bars = pd.to_numeric(df[bar_col], errors="coerce").fillna(0.0)
-
-        self._draw_histogram(days, bars, title=f"Daily {bar_col}")
-
-        sel = [self.lines_lb.get(i) for i in self.lines_lb.curselection()]
-        sel = [c for c in sel if c in df.columns]
-        self._draw_cumulative(days, df, sel)
-
-    # ------------------------------------------------------------
-    # Drawing utilities
-    # ------------------------------------------------------------
-
-    def _draw_empty(self, canvas: tk.Canvas, msg: str) -> None:
-        W = max(300, canvas.winfo_width())
-        H = max(200, canvas.winfo_height())
-        canvas.create_text(W / 2, H / 2, text=msg, fill="#5E6B85", font=("Segoe UI", 11))
-
-    def _draw_x_labels(self, canvas: tk.Canvas, days, x0, x1, y1) -> None:
-        n = len(days)
-        if n <= 1:
-            return
-        step = max(1, n // 8)  # max ~9 labels
-        for i in range(0, n, step):
-            xx = x0 + (i + 0.5) * (x1 - x0) / n
-            canvas.create_text(xx, y1 + 18, text=str(days[i]), fill="#64748B", anchor="n", font=("Segoe UI", 9))
-
-    def _nice_ticks(self, ymin: float, ymax: float, n: int = 5) -> List[float]:
-        if ymin == ymax:
-            return [ymin + i for i in range(n)]
-        return [ymin + (ymax - ymin) * (i / (n - 1)) for i in range(n)]
-
-    # ------------------------------------------------------------
-    # Histogram (with grid, axes, best/worst + tooltip support)
-    # ------------------------------------------------------------
-
-    def _draw_histogram(self, days, vals: pd.Series, title: str) -> None:
-        c = self.canvas_hist
-        W, H = max(600, c.winfo_width()), max(220, c.winfo_height())
-        left, right, top, bottom = 80, 20, 30, 55
-        x0, y0, x1, y1 = left, top, W - right, H - bottom
-
-        vmin = float(vals.min())
-        vmax = float(vals.max())
-        pad = 0.15 * max(1.0, vmax - vmin)
-        ymin = vmin - pad
-        ymax = vmax + pad
-
-        def y(v: float) -> float:
-            return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
-
-        c.create_rectangle(x0, y0, x1, y1, outline="#D8E1F0")
-
-        # grid + y ticks
-        ticks = self._nice_ticks(ymin, ymax, 5)
-        for t in ticks:
-            yy = y(float(t))
-            c.create_line(x0, yy, x1, yy, fill="#F3F6FF")
-            c.create_text(x0 - 8, yy, text=f"{t:,.0f}", anchor="e", fill="#64748B", font=("Segoe UI", 9))
-
-        # zero line
-        if ymin < 0 < ymax:
-            c.create_line(x0, y(0.0), x1, y(0.0), fill="#CBD5F5", width=2)
-
-        n = len(vals)
-        slot = (x1 - x0) / max(1, n)
-        bw = slot * 0.62
-
-        # bars
-        for i, v in enumerate(vals.tolist()):
-            xc = x0 + (i + 0.5) * slot
-            if v >= 0:
-                c.create_rectangle(xc - bw/2, y(v), xc + bw/2, y(0.0), fill="#22C55E", outline="")
-            else:
-                c.create_rectangle(xc - bw/2, y(0.0), xc + bw/2, y(v), fill="#EF4444", outline="")
-
-        # best / worst annotations
-        best_i = int(vals.idxmax())
-        worst_i = int(vals.idxmin())
-        best_v = float(vals.iloc[best_i])
-        worst_v = float(vals.iloc[worst_i])
-
-        def x_center(i: int) -> float:
-            return x0 + (i + 0.5) * slot
-
-        c.create_text(
-            x_center(best_i), y(best_v) - 10,
-            text=f"Best: {best_v:,.0f}",
-            fill="#15803D", font=("Segoe UI Semibold", 9), anchor="s"
-        )
-        c.create_text(
-            x_center(worst_i), y(worst_v) + 10,
-            text=f"Worst: {worst_v:,.0f}",
-            fill="#B91C1C", font=("Segoe UI Semibold", 9), anchor="n"
-        )
-
-        # x labels (days)
-        self._draw_x_labels(c, days, x0, x1, y1)
-
-        # title
-        c.create_text(x0, y0 - 10, text=title, anchor="w", fill="#0B1220", font=("Segoe UI Semibold", 10))
-
-        # store geometry for tooltip
-        self._hist_geom = (x0, x1, y0, y1, slot)
-        self._hist_days = days
-        self._hist_vals = vals
-
-    def _on_hist_motion(self, event) -> None:
-        if not self._hist_geom or self._hist_days is None or self._hist_vals is None:
-            return
-
-        x0, x1, y0, y1, slot = self._hist_geom
-        if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
-            self.tooltip.place_forget()
-            return
-
-        idx = int((event.x - x0) // slot)
-        if idx < 0 or idx >= len(self._hist_days):
-            self.tooltip.place_forget()
-            return
-
-        d = self._hist_days[idx]
-        v = float(self._hist_vals.iloc[idx])
-        self.tooltip.config(text=f"{d}\nPnL: {v:,.0f}")
-        self.tooltip.place(x=event.x + 12, y=event.y - 28)
-
-    # ------------------------------------------------------------
-    # Cumulative (grid, axes, weekly separators, drawdown shading, legend)
-    # ------------------------------------------------------------
-
-    def _draw_cumulative(self, days, df: pd.DataFrame, cols: List[str]) -> None:
-        c = self.canvas_cum
-        if not cols:
-            self._draw_empty(c, "Select at least one line.")
-            return
-
-        W, H = max(600, c.winfo_width()), max(260, c.winfo_height())
-        left, right, top, bottom = 80, 20, 30, 55
-        x0, y0, x1, y1 = left, top, W - right, H - bottom
-
-        palette = ["#2563EB", "#7C3AED", "#0891B2", "#EA580C", "#0EA5E9", "#A855F7"]
-
-        series = []
-        for col in cols:
-            s = pd.to_numeric(df[col], errors="coerce").fillna(0.0).cumsum()
-            if self.normalize_var.get():
-                base = float(abs(s.iloc[0])) if len(s) else 1.0
-                if base == 0.0:
-                    base = 1.0
-                s = s / base
-            series.append((col, s))
-
-        allv = pd.concat([s for _, s in series], axis=0)
-        vmin = float(allv.min())
-        vmax = float(allv.max())
-        pad = 0.15 * max(1.0, vmax - vmin)
-        ymin = vmin - pad
-        ymax = vmax + pad
-
-        def y(v: float) -> float:
-            return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
-
-        n = len(days)
-        if n <= 0:
-            self._draw_empty(c, "No days.")
-            return
-
-        def x_center(i: int) -> float:
-            return x0 + (i + 0.5) * (x1 - x0) / n
-
-        c.create_rectangle(x0, y0, x1, y1, outline="#D8E1F0")
-
-        # grid + y ticks
-        ticks = self._nice_ticks(ymin, ymax, 5)
-        for t in ticks:
-            yy = y(float(t))
-            c.create_line(x0, yy, x1, yy, fill="#F3F6FF")
-            c.create_text(x0 - 8, yy, text=f"{t:,.2f}", anchor="e", fill="#64748B", font=("Segoe UI", 9))
-
-        # zero line
-        if ymin < 0 < ymax:
-            c.create_line(x0, y(0.0), x1, y(0.0), fill="#CBD5F5", width=2)
-
-        # weekly separators (Mondays)
-        for i, d in enumerate(days):
-            if isinstance(d, date) and d.weekday() == 0:
-                xx = x_center(i)
-                c.create_line(xx, y0, xx, y1, fill="#E5E7EB")
-
-        # drawdown shading for first selected series (cheap + useful)
-        base_name, base_s = series[0]
-        run_max = base_s.cummax()
-        pts = []
-        for i in range(n):
-            pts.append((x_center(i), y(float(run_max.iloc[i]))))
-        for i in reversed(range(n)):
-            pts.append((x_center(i), y(float(base_s.iloc[i]))))
-        flat = [p for xy in pts for p in xy]
-        if len(flat) >= 6:
-            c.create_polygon(*flat, fill="#FEE2E2", outline="", stipple="gray12")
-
-        # draw lines + max/min annotation per first line
-        for k, (name, s) in enumerate(series):
-            col = palette[k % len(palette)]
-            pts = []
-            for i in range(n):
-                pts.extend([x_center(i), y(float(s.iloc[i]))])
-            if len(pts) >= 4:
-                c.create_line(*pts, fill=col, width=2)
-
-            # legend row (left column)
-            row = ttk.Frame(self.legend_frame)
-            row.pack(anchor="w", pady=2)
-            sw = tk.Canvas(row, width=16, height=10, highlightthickness=0)
-            sw.create_line(0, 5, 16, 5, fill=col, width=3)
-            sw.pack(side="left", padx=(0, 6))
-            ttk.Label(row, text=name).pack(side="left")
-
-        # annotate max/min for first line (clean)
-        max_i = int(base_s.idxmax())
-        min_i = int(base_s.idxmin())
-        max_v = float(base_s.iloc[max_i])
-        min_v = float(base_s.iloc[min_i])
-        c.create_text(
-            x_center(max_i), y(max_v) - 10,
-            text=f"Max: {max_v:,.2f}",
-            fill="#1D4ED8", font=("Segoe UI Semibold", 9), anchor="s"
-        )
-        c.create_text(
-            x_center(min_i), y(min_v) + 10,
-            text=f"Min: {min_v:,.2f}",
-            fill="#7C3AED", font=("Segoe UI Semibold", 9), anchor="n"
-        )
-
-        # x labels (days)
-        self._draw_x_labels(c, days, x0, x1, y1)
-
-        # title
-        c.create_text(x0, y0 - 10, text="Cumulative PnL", anchor="w", fill="#0B1220",
-                      font=("Segoe UI Semibold", 10))
+            self._tooltip = None
