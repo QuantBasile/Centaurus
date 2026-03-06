@@ -58,21 +58,14 @@ class _SortState:
 
 class DayReportSheet(ttk.Frame):
     """
-    Day - Report (MULTI-DAY):
-      - Select multiple days (available days list) + filter entry
-      - Table has ONE ROW per (date, underlyingName), using EOD last trade per (date, underlying)
+    Day - Report (MULTI-DAY), clean version without adjustments:
+      - Select multiple days
+      - One row per (date, underlyingName), using EOD last trade per (date, underlying)
       - Columns:
-          date, underlyingName, feesCum, PnLVonDeltaCum, PremiaCum, Total, Anpassung, trades, portfolio
+          date, underlyingName, feesCum, PnLVonDeltaCum, PremiaCum, Total, trades, portfolio
       - Sortable by clicking headers
-      - Bottom row: ALL (sum) - always stays at bottom even after sort
-      - Export HTML:
-          * sticky header
-          * scroll inside panel
-          * sticky ALL row (tfoot)
-          * right-aligned integer numbers
-          * click header to sort (JS)
-          * click row to highlight (JS)
-          * after saving: path copied to clipboard + toast in app
+      - Bottom row: ALL (sum), always stays at bottom
+      - Export HTML with sticky header/footer, row highlight, sorting, clipboard path copy
     """
 
     sheet_id = "day_report"
@@ -85,21 +78,19 @@ class DayReportSheet(ttk.Frame):
         "PnLVonDeltaCum",
         "PremiaCum",
         "Total",
-        "Anpassung",
         "trades",
         "portfolio",
     ]
 
-    NUMERIC_COLS = ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung", "trades"]
+    NUMERIC_COLS = ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "trades"]
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
 
         self._trades: Optional[pd.DataFrame] = None
-        self._adj: Optional[pd.DataFrame] = None
 
         self._master: pd.DataFrame = pd.DataFrame()   # precomputed (date, underlying)
-        self._available_dates: List[str] = []         # ISO strings
+        self._available_dates: List[str] = []
 
         self._df_day: pd.DataFrame = pd.DataFrame()   # selected days view (incl ALL)
         self._cache: Dict[str, List[str]] = {}
@@ -127,7 +118,6 @@ class DayReportSheet(ttk.Frame):
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=14, pady=(0, 10))
 
-        # Days selector (filter + listbox)
         ttk.Label(controls, text="Days (filter)", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.day_filter_var, width=16).grid(
             row=1, column=0, sticky="w", padx=(0, 10)
@@ -145,26 +135,25 @@ class DayReportSheet(ttk.Frame):
         ttk.Button(btns, text="Apply", style="Accent.TButton", width=7, command=self._apply_days).pack(
             fill="x", pady=(12, 0)
         )
-        ttk.Button(btns, text="Clear", style="Pink.TButton", width=7, command=self._clear_days).pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Clear", style="Pink.TButton", width=7, command=self._clear_days).pack(
+            fill="x", pady=(6, 0)
+        )
 
         self.export_btn = ttk.Button(
             controls, text="Export HTML", style="Purple.TButton", command=self._export_html, state="disabled"
         )
         self.export_btn.grid(row=1, column=2, sticky="w", padx=(14, 0))
 
-        # Small toast label (auto hides)
         ttk.Label(controls, textvariable=self.toast_var, style="Muted.TLabel").grid(
             row=1, column=3, sticky="w", padx=(14, 0)
         )
 
         controls.columnconfigure(4, weight=1)
 
-        # Summary line under controls (uses ALL row)
         summ = ttk.Frame(self)
         summ.pack(fill="x", padx=14, pady=(0, 8))
         ttk.Label(summ, textvariable=self.summary_var, style="Muted.TLabel").pack(side="left")
 
-        # Table
         card = ttk.Frame(self, style="Card.TFrame")
         card.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         inner = ttk.Frame(card, style="Card.TFrame")
@@ -184,21 +173,18 @@ class DayReportSheet(ttk.Frame):
 
         self.tree.tag_configure("odd", background="#FFFFFF")
         self.tree.tag_configure("even", background="#F8FAFF")
-        self.tree.tag_configure("allrow", background="#EEF2FF")  # ALL row
+        self.tree.tag_configure("allrow", background="#EEF2FF")
 
         self._init_columns()
-        # Local button styles (fast, no global theme refactor)
+
         style = ttk.Style()
-        
-        # Purple export
         style.configure("Purple.TButton", padding=(10, 6))
         style.map(
             "Purple.TButton",
             background=[("!disabled", "#7C3AED"), ("active", "#6D28D9"), ("disabled", "#E5E7EB")],
             foreground=[("!disabled", "white"), ("disabled", "#9CA3AF")],
         )
-        
-        # Light pink clear
+
         style.configure("Pink.TButton", padding=(10, 6))
         style.map(
             "Pink.TButton",
@@ -253,7 +239,6 @@ class DayReportSheet(ttk.Frame):
         self.days_lb.selection_clear(0, "end")
 
     def _selected_days(self) -> List[DateType]:
-        # listbox contains the filtered list; read strings from listbox itself
         out: List[DateType] = []
         for i in self.days_lb.curselection():
             s = self.days_lb.get(i)
@@ -276,10 +261,6 @@ class DayReportSheet(ttk.Frame):
     # -------------------------
     def on_df_loaded(self, trades: pd.DataFrame) -> None:
         self._trades = trades
-        self._rebuild_master_if_ready()
-
-    def on_adjustment_loaded(self, adj: pd.DataFrame) -> None:
-        self._adj = adj
         self._rebuild_master_if_ready()
 
     # -------------------------
@@ -306,7 +287,6 @@ class DayReportSheet(ttk.Frame):
                 self.info_var.set(f"Missing column: {c}")
                 return
 
-        # trades count per (date, underlying)
         cnt = (
             df.groupby(["date", "underlyingName"], sort=False)
             .size()
@@ -314,7 +294,6 @@ class DayReportSheet(ttk.Frame):
             .reset_index()
         )
 
-        # last trade per (date, underlying)
         tt = pd.to_datetime(df["tradeTime"], errors="coerce")
         helper = pd.DataFrame(
             {"date": df["date"], "underlyingName": df["underlyingName"], "_tt": tt}
@@ -336,21 +315,7 @@ class DayReportSheet(ttk.Frame):
         out = last.merge(cnt, on=["date", "underlyingName"], how="left")
         out["trades"] = pd.to_numeric(out["trades"], errors="coerce").fillna(0).astype(int)
 
-        # merge adjustments (Anpassung)
-        adj = self._adj
-        if adj is not None and not adj.empty and "date" in adj.columns and "underlyingName" in adj.columns:
-            a = adj.copy()
-            if "Anpassung" not in a.columns:
-                a["Anpassung"] = 0.0
-            a["Anpassung"] = pd.to_numeric(a["Anpassung"], errors="coerce").fillna(0.0)
-            a = a.groupby(["date", "underlyingName"], sort=False, as_index=False)[["Anpassung"]].sum()
-            out = out.merge(a, on=["date", "underlyingName"], how="left")
-            out["Anpassung"] = out["Anpassung"].fillna(0.0)
-        else:
-            out["Anpassung"] = 0.0
-
-        # enforce numeric
-        for c in ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung"]:
+        for c in ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total"]:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
 
         out = out.sort_values(["date", "underlyingName"], kind="mergesort").reset_index(drop=True)
@@ -361,7 +326,6 @@ class DayReportSheet(ttk.Frame):
         self._available_dates = [d.isoformat() if hasattr(d, "isoformat") else str(d) for d in dates]
         self._refresh_days_listbox()
 
-        # Preselect last day by default
         if self._available_dates:
             self.days_lb.selection_clear(0, "end")
             self.days_lb.selection_set(len(self._available_dates) - 1)
@@ -396,20 +360,16 @@ class DayReportSheet(ttk.Frame):
             self.export_btn.configure(state="disabled")
             return
 
-        # Add ALL row at bottom (sum over all selected days + all underlyings)
         all_row = self._build_all_row(view)
         view = pd.concat([view, all_row], ignore_index=True)
 
         self._sort = _SortState()
         self._set_day_df(view)
 
-        # Summary (PnL = Total + Anpassung)
         r = all_row.iloc[0]
         trades = int(r.get("trades", 0))
-        total = float(r.get("Total", 0.0))
-        adj = float(r.get("Anpassung", 0.0))
+        pnl = float(r.get("Total", 0.0))
         fees = float(r.get("feesCum", 0.0))
-        pnl = total + adj
         self.summary_var.set(f"ALL  |  Trades: {trades:,}  |  PnL: {pnl:,.0f}  |  Fees: {fees:,.0f}")
 
         self.info_var.set(f"Days: {len(sel_days)} | rows: {len(view)-1:,} (+ALL)")
@@ -427,7 +387,6 @@ class DayReportSheet(ttk.Frame):
             "PnLVonDeltaCum": sums.get("PnLVonDeltaCum", 0.0),
             "PremiaCum": sums.get("PremiaCum", 0.0),
             "Total": sums.get("Total", 0.0),
-            "Anpassung": sums.get("Anpassung", 0.0),
             "trades": sums.get("trades", 0),
             "portfolio": "",
         }
@@ -464,7 +423,6 @@ class DayReportSheet(ttk.Frame):
         if df is None or df.empty or col not in df.columns:
             return
 
-        # keep ALL at bottom always
         has_all = ("underlyingName" in df.columns) and (df["underlyingName"].astype(str) == "ALL").any()
         if has_all:
             df_main = df[df["underlyingName"].astype(str) != "ALL"].copy()
@@ -500,7 +458,6 @@ class DayReportSheet(ttk.Frame):
             self.info_var.set("Nothing to export.")
             return
 
-        # Separate ALL row -> sticky footer
         main = df[df["underlyingName"].astype(str) != "ALL"].copy() if "underlyingName" in df.columns else df.copy()
         all_row = df[df["underlyingName"].astype(str) == "ALL"].copy() if "underlyingName" in df.columns else pd.DataFrame(columns=df.columns)
 
@@ -522,14 +479,12 @@ class DayReportSheet(ttk.Frame):
             cls_attr = f' class="{extra_cls}"' if extra_cls else ""
             return f"<tr{cls_attr}>" + "".join(row_cells) + "</tr>"
 
-        # THEAD with data-type for sorting
         thead_cells = []
         for c in cols:
             dtype = "num" if c in num_cols else "txt"
             thead_cells.append(f'<th data-type="{dtype}">{_html.escape(c)}</th>')
         thead = "<thead><tr>" + "".join(thead_cells) + "</tr></thead>"
 
-        # TBODY rows
         body_rows = []
         for _, r in main.iterrows():
             cells = []
@@ -542,7 +497,6 @@ class DayReportSheet(ttk.Frame):
             body_rows.append(tr(cells))
         tbody = "<tbody>" + "".join(body_rows) + "</tbody>"
 
-        # TFOOT ALL row sticky
         tfoot = ""
         if not all_row.empty:
             r = all_row.iloc[0]
@@ -555,15 +509,12 @@ class DayReportSheet(ttk.Frame):
                     cells.append(td(_html.escape("" if pd.isna(v) else str(v)), "txt"))
             tfoot = "<tfoot>" + tr(cells, "allrow") + "</tfoot>"
 
-        # KPI strip (from ALL)
         kpi_html = ""
         if not all_row.empty:
             r = all_row.iloc[0]
             trades = int(round(float(r.get("trades", 0) or 0)))
-            total = float(r.get("Total", 0.0) or 0.0)
-            adj = float(r.get("Anpassung", 0.0) or 0.0)
+            pnl = float(r.get("Total", 0.0) or 0.0)
             fees = float(r.get("feesCum", 0.0) or 0.0)
-            pnl = total + adj
             kpi_html = f"""
               <div class="kpis">
                 <div class="kpi"><div class="kpiLabel">PnL</div><div class="kpiVal">{pnl:,.0f}</div></div>
@@ -572,7 +523,6 @@ class DayReportSheet(ttk.Frame):
               </div>
             """
 
-        # Title label: show selected days compactly
         sel_days = [self.days_lb.get(i) for i in self.days_lb.curselection()]
         if len(sel_days) == 1:
             title_label = sel_days[0]
@@ -657,7 +607,6 @@ class DayReportSheet(ttk.Frame):
     overflow: hidden;
   }}
 
-  /* scroll inside the panel */
   .table-scroll {{
     max-height: calc(100vh - 190px);
     overflow: auto;
@@ -717,7 +666,6 @@ class DayReportSheet(ttk.Frame):
     text-align: left;
   }}
 
-  /* Sticky ALL row at bottom */
   tfoot td {{
     position: sticky;
     bottom: 0;
@@ -726,7 +674,6 @@ class DayReportSheet(ttk.Frame):
     border-top: 2px solid #c7d2fe;
     font-weight: 800;
   }}
-
 </style>
 </head>
 <body>
@@ -754,7 +701,6 @@ class DayReportSheet(ttk.Frame):
   const tbody = table.querySelector("tbody");
   const headers = Array.from(table.querySelectorAll("thead th"));
 
-  // Row selection highlight
   let selected = null;
   table.addEventListener("click", (e) => {{
     const tr = e.target.closest("tbody tr");
@@ -764,7 +710,6 @@ class DayReportSheet(ttk.Frame):
     selected = tr;
   }});
 
-  // Sorting (tbody only, footer stays sticky)
   const sortState = {{ idx: -1, asc: true }};
 
   function getCellValue(tr, idx, type) {{
@@ -833,7 +778,6 @@ class DayReportSheet(ttk.Frame):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(html_doc)
 
-            # Copy path to clipboard for instant Ctrl+V in browser
             try:
                 self.clipboard_clear()
                 self.clipboard_append(path)

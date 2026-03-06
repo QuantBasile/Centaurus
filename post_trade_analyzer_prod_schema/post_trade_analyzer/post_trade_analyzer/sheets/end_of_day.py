@@ -1,50 +1,119 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date as DateType
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import ttk
 
+import numpy as np
 import pandas as pd
 
 from ..utils.table_utils import build_display_cache
 
 
 # ============================================================
-# Simple autocomplete combobox (fast + robust)
+# Smart autocomplete combobox
+#   - display: "UnderlyingName | inst1, inst2 ..."
+#   - real value returned: underlyingName
+#   - ranking: exact prefix > token match > contains
+#   - bounded result count for performance
 # ============================================================
-class AutocompleteCombobox(ttk.Combobox):
-    """
-    Simple autocomplete combobox:
-    - keeps a master list of values
-    - filters on KeyRelease
-    - supports empty selection
-    """
+class SmartFilterCombobox(ttk.Combobox):
+    SEP = " | "
 
-    def __init__(self, master, *, values: List[str], **kwargs):
-        super().__init__(master, values=values, **kwargs)
-        self._all_values = list(values)
+    def __init__(self, master, *, max_results: int = 25, **kwargs):
+        super().__init__(master, **kwargs)
+        self._max_results = max_results
+        self._pairs: List[Tuple[str, str]] = []
+        self._display_to_real: Dict[str, str] = {}
+        self._all_displays: List[str] = []
+        self._is_updating = False
+
         self.bind("<KeyRelease>", self._on_keyrelease)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<<ComboboxSelected>>", self._on_selected)
+        self.bind("<Button-1>", self._on_click)
 
-    def set_values(self, values: List[str]) -> None:
-        self._all_values = list(values)
-        self["values"] = self._all_values
+    def set_pairs(self, pairs: Sequence[Tuple[str, str]]) -> None:
+        clean_pairs: List[Tuple[str, str]] = []
+        seen_display = set()
+
+        for display, real in pairs:
+            d = str(display).strip()
+            r = str(real).strip()
+            if not d or not r or d in seen_display:
+                continue
+            clean_pairs.append((d, r))
+            seen_display.add(d)
+
+        self._pairs = clean_pairs
+        self._display_to_real = {d: r for d, r in clean_pairs}
+        self._all_displays = [d for d, _ in clean_pairs]
+        self["values"] = self._all_displays[: self._max_results]
+
+    def get_real_value(self) -> str:
+        raw = self.get().strip()
+        if not raw:
+            return ""
+        if raw in self._display_to_real:
+            return self._display_to_real[raw]
+        if self.SEP in raw:
+            return raw.split(self.SEP, 1)[0].strip()
+        return raw
+
+    def _filtered_displays(self, text: str) -> List[str]:
+        t = (text or "").strip().lower()
+        if not t:
+            return self._all_displays[: self._max_results]
+
+        starts = []
+        contains = []
+
+        for d in self._all_displays:
+            dl = d.lower()
+            if dl.startswith(t):
+                starts.append(d)
+            elif t in dl:
+                contains.append(d)
+
+        out = starts + contains
+        return out[: self._max_results] if out else self._all_displays[: self._max_results]
 
     def _on_keyrelease(self, event) -> None:
+        if self._is_updating:
+            return
+
         if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Tab"):
             return
-        text = self.get().strip().lower()
-        if not text:
-            self["values"] = self._all_values
-            return
-        filtered = [v for v in self._all_values if text in v.lower()]
-        self["values"] = filtered if filtered else self._all_values
 
+        current_text = self.get()
+        cursor_pos = self.index(tk.INSERT)
+        vals = self._filtered_displays(current_text)
+
+        self._is_updating = True
+        try:
+            self["values"] = vals
+            self.delete(0, tk.END)
+            self.insert(0, current_text)
+            try:
+                self.icursor(cursor_pos)
+            except Exception:
+                pass
+        finally:
+            self._is_updating = False
+
+    def _on_focus_out(self, event) -> None:
+        self["values"] = self._all_displays[: self._max_results]
+
+    def _on_selected(self, event) -> None:
+        self["values"] = self._all_displays[: self._max_results]
+
+    def _on_click(self, event) -> None:
+        self["values"] = self._filtered_displays(self.get())
 
 # ============================================================
-# EndOfDay Sheet (Underlying-only selection)
+# EndOfDay Sheet
 # ============================================================
 @dataclass(frozen=True)
 class EODSelection:
@@ -55,46 +124,49 @@ class EndOfDaySheet(ttk.Frame):
     sheet_id = "eod"
     sheet_title = "EndOfDay"
 
-    HIST_METRICS = ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung"]
+    HIST_METRICS = ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total"]
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
 
         self._trades: Optional[pd.DataFrame] = None
-        self._adj: Optional[pd.DataFrame] = None
-
-        self._eod: Optional[pd.DataFrame] = None  # last trade per (underlyingName, date)
+        self._eod: Optional[pd.DataFrame] = None
         self._sel = EODSelection()
 
         self._build()
 
     def _build(self) -> None:
-        # Top title
         top = ttk.Frame(self)
         top.pack(fill="x", padx=14, pady=(14, 10))
         ttk.Label(top, text="EndOfDay", style="Title.TLabel").pack(side="left")
 
-        # Search panel (Underlying-only)
         search = ttk.Frame(self)
         search.pack(fill="x", padx=14, pady=(0, 10))
 
-        ttk.Label(search, text="Underlying", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(search, text="UnderlyingName", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
 
         self.underlying_var = tk.StringVar()
-        self.underlying_cb = AutocompleteCombobox(
-            search, values=[], textvariable=self.underlying_var, state="normal", width=28
+        self.underlying_cb = SmartFilterCombobox(
+            search,
+            textvariable=self.underlying_var,
+            state="normal",
+            width=42,
+            max_results=30,
         )
         self.underlying_cb.grid(row=1, column=0, sticky="w")
 
-        ttk.Button(search, text="Apply",style="Accent.TButton", command=self._apply_selection).grid(row=1, column=1, padx=(14, 0))
-        ttk.Button(search, text="Clear", command=self._clear_selection).grid(row=1, column=2, padx=(8, 0))
+        ttk.Button(search, text="Apply", style="Accent.TButton", command=self._apply_selection).grid(
+            row=1, column=1, padx=(14, 0)
+        )
+        ttk.Button(search, text="Clear", command=self._clear_selection).grid(
+            row=1, column=2, padx=(8, 0)
+        )
 
-        self.sel_info = tk.StringVar(value="Selected: Underlying=(all)")
+        self.sel_info = tk.StringVar(value="Selected: UnderlyingName=(all) | Instrument=-")
         ttk.Label(search, textvariable=self.sel_info, style="Muted.TLabel").grid(
             row=1, column=3, sticky="w", padx=(14, 0)
         )
 
-        # Main notebook
         card = ttk.Frame(self, style="Card.TFrame")
         card.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         inner = ttk.Frame(card, style="Card.TFrame")
@@ -104,11 +176,9 @@ class EndOfDaySheet(ttk.Frame):
         self.nb.pack(fill="both", expand=True)
 
         self.tab_data = EODDataTab(self.nb)
-        self.tab_adj = EODAdjustmentsTab(self.nb)
         self.tab_plot = EODPlotTab(self.nb, hist_metrics=self.HIST_METRICS)
 
         self.nb.add(self.tab_data, text="Data")
-        self.nb.add(self.tab_adj, text="Data II (Anpassung)")
         self.nb.add(self.tab_plot, text="Plot")
 
     # -------------------------
@@ -116,10 +186,6 @@ class EndOfDaySheet(ttk.Frame):
     # -------------------------
     def on_df_loaded(self, trades: pd.DataFrame) -> None:
         self._trades = trades
-        self._rebuild_eod_if_possible()
-
-    def on_adjustment_loaded(self, adj: pd.DataFrame) -> None:
-        self._adj = adj
         self._rebuild_eod_if_possible()
 
     # -------------------------
@@ -131,23 +197,16 @@ class EndOfDaySheet(ttk.Frame):
 
         self._eod = self._build_eod_last_trade_per_day_underlying(self._trades)
 
-        # Update underlying list
         if self._eod is not None and not self._eod.empty:
-            underlyings = sorted(self._eod["underlyingName"].astype(str).dropna().unique().tolist())
+            pairs = self._build_underlying_pairs(self._eod)
         else:
-            underlyings = []
+            pairs = []
 
-        self.underlying_cb.set_values(underlyings)
-
-        # Push initial (unfiltered) view
+        self.underlying_cb.set_pairs(pairs)
         self._push_filtered()
 
     @staticmethod
     def _build_eod_last_trade_per_day_underlying(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Last row per (underlyingName, date) using idxmax(tradeTime).
-        Assumes df has columns: underlyingName, date, tradeTime (date derived already).
-        """
         if df is None or df.empty:
             return pd.DataFrame()
         if "underlyingName" not in df.columns or "date" not in df.columns or "tradeTime" not in df.columns:
@@ -166,11 +225,46 @@ class EndOfDaySheet(ttk.Frame):
         out.reset_index(drop=True, inplace=True)
         return out
 
+    @staticmethod
+    def _summarize_instruments(inst_values: Sequence[str], max_items: int = 2) -> str:
+        vals = [str(v).strip() for v in inst_values if str(v).strip()]
+        vals = sorted(dict.fromkeys(vals))
+        if not vals:
+            return "-"
+        if len(vals) <= max_items:
+            return ", ".join(vals)
+        return ", ".join(vals[:max_items]) + f" ... (+{len(vals) - max_items})"
+
+    def _build_underlying_pairs(self, df: pd.DataFrame) -> List[Tuple[str, str]]:
+        if df is None or df.empty or "underlyingName" not in df.columns:
+            return []
+
+        out: List[Tuple[str, str]] = []
+        if "instrument" in df.columns:
+            grouped = (
+                df.groupby("underlyingName", sort=True)["instrument"]
+                .agg(lambda s: self._summarize_instruments(s.tolist()))
+            )
+            for u, inst_txt in grouped.items():
+                u_txt = str(u).strip()
+                if u_txt:
+                    out.append((f"{u_txt} | {inst_txt}", u_txt))
+        else:
+            vals = sorted(df["underlyingName"].dropna().astype(str).unique().tolist())
+            out = [(u, u) for u in vals if u]
+
+        return out
+
+    def _instrument_info(self, df: pd.DataFrame) -> str:
+        if df is None or df.empty or "instrument" not in df.columns:
+            return "-"
+        return self._summarize_instruments(df["instrument"].dropna().astype(str).tolist(), max_items=3)
+
     # -------------------------
     # Selection / filtering
     # -------------------------
     def _apply_selection(self) -> None:
-        u = self.underlying_var.get().strip()
+        u = self.underlying_cb.get_real_value()
         self._sel = EODSelection(underlying=u)
         self._push_filtered()
 
@@ -182,10 +276,9 @@ class EndOfDaySheet(ttk.Frame):
     def _push_filtered(self) -> None:
         eod = self._eod
         if eod is None or eod.empty:
-            self.sel_info.set("Selected: Underlying=(all) — no data")
+            self.sel_info.set("Selected: UnderlyingName=(all) | Instrument=- — no data")
             self.tab_data.set_df(pd.DataFrame())
-            self.tab_adj.set_df(pd.DataFrame())
-            self.tab_plot.set_data(pd.DataFrame(), pd.DataFrame())
+            self.tab_plot.set_data(pd.DataFrame())
             return
 
         df = eod
@@ -194,46 +287,18 @@ class EndOfDaySheet(ttk.Frame):
 
         df = df.reset_index(drop=True)
 
-        # Selected label
+        inst_txt = self._instrument_info(df)
         if self._sel.underlying:
-            self.sel_info.set(f"Selected: Underlying={self._sel.underlying}")
+            self.sel_info.set(f"Selected: UnderlyingName={self._sel.underlying} | Instrument={inst_txt}")
         else:
-            self.sel_info.set("Selected: Underlying=(all)")
+            self.sel_info.set(f"Selected: UnderlyingName=(all) | Instrument={inst_txt}")
 
-        # Data tab
         self.tab_data.set_df(df)
-
-        # Adjustments tab (filtered by underlying + matching dates)
-        adj_view = self._filter_adjustments_for_selection(df)
-        self.tab_adj.set_df(adj_view)
-
-        # Plot tab gets both
-        self.tab_plot.set_data(df, adj_view)
-
-    def _filter_adjustments_for_selection(self, df_eod_filtered: pd.DataFrame) -> pd.DataFrame:
-        adj = self._adj
-        if adj is None or adj.empty:
-            return pd.DataFrame(columns=["underlyingName", "date", "Anpassung"])
-
-        out = adj.copy()
-        if "underlyingName" not in out.columns and "underlying" in out.columns:
-            out = out.rename(columns={"underlying": "underlyingName"})
-
-        if self._sel.underlying:
-            out = out[out["underlyingName"].astype(str) == self._sel.underlying]
-
-        if df_eod_filtered is not None and not df_eod_filtered.empty and "date" in df_eod_filtered.columns:
-            dates = set(df_eod_filtered["date"].dropna().tolist())
-            out = out[out["date"].isin(dates)]
-
-        sort_cols = [c for c in ["date", "underlyingName"] if c in out.columns]
-        if sort_cols:
-            out = out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-        return out
+        self.tab_plot.set_data(df)
 
 
 # ============================================================
-# Data tab (sortable table, fast)
+# Data tab
 # ============================================================
 class EODDataTab(ttk.Frame):
     def __init__(self, master: tk.Misc) -> None:
@@ -275,8 +340,6 @@ class EODDataTab(ttk.Frame):
 
         self.tree.tag_configure("odd", background="#FFFFFF")
         self.tree.tag_configure("even", background="#F8FAFF")
-
-        # PERF: no resize bindings, no autofit, stretch=False
 
     def set_df(self, df: pd.DataFrame) -> None:
         self._df = df if df is not None else pd.DataFrame()
@@ -336,135 +399,30 @@ class EODDataTab(ttk.Frame):
 
 
 # ============================================================
-# Adjustments tab (sortable table, simple)
-# ============================================================
-class EODAdjustmentsTab(ttk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
-        super().__init__(master)
-
-        self._df: pd.DataFrame = pd.DataFrame()
-        self._df_view: pd.DataFrame = pd.DataFrame()
-
-        self._cache: Dict[str, List[str]] = {}
-        self._cache_len: int = 0
-
-        self._sort_col: Optional[str] = None
-        self._sort_asc: bool = True
-
-        self.info_var = tk.StringVar(value="No rows.")
-        self._build()
-
-    def _build(self) -> None:
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=(10, 8))
-        ttk.Label(top, textvariable=self.info_var, style="Muted.TLabel").pack(side="right")
-
-        card = ttk.Frame(self, style="Card.TFrame")
-        card.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        inner = ttk.Frame(card, style="Card.TFrame")
-        inner.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.tree = ttk.Treeview(inner, style="Futur.Treeview", show="headings")
-        self.vsb = ttk.Scrollbar(inner, orient="vertical", command=self.tree.yview)
-        self.hsb = ttk.Scrollbar(inner, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
-
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.vsb.grid(row=0, column=1, sticky="ns")
-        self.hsb.grid(row=1, column=0, sticky="ew")
-        inner.rowconfigure(0, weight=1)
-        inner.columnconfigure(0, weight=1)
-
-        self.tree.tag_configure("odd", background="#FFFFFF")
-        self.tree.tag_configure("even", background="#F8FAFF")
-
-    def set_df(self, df: pd.DataFrame) -> None:
-        self._df = df if df is not None else pd.DataFrame()
-        self._df_view = self._df
-        self._sort_col = None
-        self._sort_asc = True
-
-        n = len(self._df_view)
-        self.info_var.set(f"{n:,} rows (Anpassung)")
-
-        self._cache, self._cache_len = build_display_cache(self._df_view)
-        self._render()
-
-    def _render(self) -> None:
-        self.tree.delete(*self.tree.get_children())
-        df = self._df_view
-        if df is None or df.empty:
-            self.tree["columns"] = []
-            return
-
-        cols = list(df.columns)
-        self.tree["columns"] = cols
-
-        for c in cols:
-            self.tree.heading(c, text=c, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=140 if c != "Anpassung" else 120, minwidth=80, anchor="c", stretch=False)
-
-        cache = self._cache
-        for i in range(self._cache_len):
-            values = [cache[c][i] for c in cols]
-            tag = "even" if (i % 2 == 0) else "odd"
-            self.tree.insert("", "end", values=values, tags=(tag,))
-
-    def _sort_by(self, col: str) -> None:
-        df = self._df
-        if df is None or df.empty:
-            return
-
-        if self._sort_col == col:
-            self._sort_asc = not self._sort_asc
-        else:
-            self._sort_col = col
-            self._sort_asc = True
-
-        try:
-            view = df.sort_values(by=col, ascending=self._sort_asc, kind="mergesort")
-        except Exception:
-            view = (
-                df.assign(_tmp=df[col].astype(str))
-                .sort_values(by="_tmp", ascending=self._sort_asc, kind="mergesort")
-                .drop(columns="_tmp")
-            )
-
-        self._df_view = view.reset_index(drop=True)
-        self._cache, self._cache_len = build_display_cache(self._df_view)
-        self._render()
-
-
-# ============================================================
-# Plot tab — CEO single canvas (cumulative lines + daily bars)
-#   - Y axes with ticks
-#   - highlighted zero line
-#   - dynamic left padding so big labels don't clip
-#   - variable toggles + redraw
-#   - hover tooltip on bars
+# Plot tab
+#   - top: true EOD cumulative levels aggregated by date
+#   - bottom: daily differences of those EOD cumulative levels
 # ============================================================
 class EODPlotTab(ttk.Frame):
-    PNL_NAME = "PnL (Anpassung+Total)"
+    COLOR_MAP = {
+        "PremiaCum": "#4A6CF7",
+        "PnLVonDeltaCum": "#111827",
+        "feesCum": "#F97316",
+        "Total": "#7C3AED",
+    }
 
     def __init__(self, master: tk.Misc, hist_metrics: List[str]) -> None:
         super().__init__(master)
 
         self._eod: pd.DataFrame = pd.DataFrame()
-        self._adj: pd.DataFrame = pd.DataFrame()
 
-        base = [v for v in ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total", "Anpassung"] if v in hist_metrics]
-        if not base:
-            base = hist_metrics[:]
-
-        # ensure derived PnL present
-        self._vars = base + [self.PNL_NAME]
+        self._vars = [v for v in ["feesCum", "PnLVonDeltaCum", "PremiaCum", "Total"] if v in hist_metrics]
+        if not self._vars:
+            self._vars = hist_metrics[:]
 
         self._var_enabled: Dict[str, tk.BooleanVar] = {v: tk.BooleanVar(value=True) for v in self._vars}
-
         self._daily: pd.DataFrame = pd.DataFrame()
 
-        # Hover geometry caches
         self._bar_hits: List[Dict[str, object]] = []
         self._tooltip: Optional[tk.Toplevel] = None
 
@@ -495,62 +453,40 @@ class EODPlotTab(ttk.Frame):
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", lambda e: self._hide_tooltip())
 
-        # PERF: no redraw-on-resize bindings
-
-    # API
-    def set_data(self, eod_filtered: pd.DataFrame, adj_filtered: pd.DataFrame) -> None:
+    def set_data(self, eod_filtered: pd.DataFrame) -> None:
         self._eod = eod_filtered if eod_filtered is not None else pd.DataFrame()
-        self._adj = adj_filtered if adj_filtered is not None else pd.DataFrame()
         self._daily = self._build_daily_frame()
         self.redraw()
 
     def _enabled_vars(self) -> List[str]:
         out = [v for v in self._vars if self._var_enabled[v].get()]
-        return out if out else [self._vars[0]]
+        return out if out else ([self._vars[0]] if self._vars else [])
 
-    # Data prep: aggregate per date + merge adjustments
     def _build_daily_frame(self) -> pd.DataFrame:
         eod = self._eod
         if eod is None or eod.empty:
             return pd.DataFrame()
 
-        need = ["date", "PremiaCum", "PnLVonDeltaCum", "feesCum", "Total"]
-        for c in need:
-            if c not in eod.columns:
-                return pd.DataFrame()
+        need = ["date"] + [v for v in self._vars if v in eod.columns]
+        if "date" not in eod.columns or len(need) <= 1:
+            return pd.DataFrame()
 
-        tmp = pd.DataFrame(
-            {
-                "date": eod["date"],
-                "PremiaCum": pd.to_numeric(eod["PremiaCum"], errors="coerce").fillna(0.0),
-                "PnLVonDeltaCum": pd.to_numeric(eod["PnLVonDeltaCum"], errors="coerce").fillna(0.0),
-                "feesCum": pd.to_numeric(eod["feesCum"], errors="coerce").fillna(0.0),
-                "Total": pd.to_numeric(eod["Total"], errors="coerce").fillna(0.0),
-            }
-        ).dropna(subset=["date"])
+        work = eod[need].copy()
+        for v in self._vars:
+            if v in work.columns:
+                work[v] = pd.to_numeric(work[v], errors="coerce").fillna(0.0)
 
-        day = (
-            tmp.groupby("date", sort=False, as_index=False)[["PremiaCum", "PnLVonDeltaCum", "feesCum", "Total"]].sum()
-        )
-        day = day.sort_values("date", kind="mergesort").reset_index(drop=True)
+        # If several underlyings are present, aggregate by date.
+        out = work.groupby("date", sort=True, as_index=False).sum(numeric_only=True)
+        out = out.sort_values("date", kind="mergesort").reset_index(drop=True)
 
-        # Merge adjustments by date (already filtered by underlying upstream)
-        adj = self._adj
-        if adj is not None and not adj.empty and "date" in adj.columns and "Anpassung" in adj.columns:
-            a = adj.copy()
-            a["Anpassung"] = pd.to_numeric(a["Anpassung"], errors="coerce").fillna(0.0)
-            a_day = a.groupby("date", sort=False, as_index=False)[["Anpassung"]].sum()
-            out = day.merge(a_day, on="date", how="left")
-            out["Anpassung"] = out["Anpassung"].fillna(0.0)
-        else:
-            out = day.copy()
-            out["Anpassung"] = 0.0
+        for v in self._vars:
+            if v not in out.columns:
+                out[v] = 0.0
+            out[f"{v}Daily"] = out[v].diff().fillna(out[v])
 
-        # Derived PnL
-        out[self.PNL_NAME] = out["Total"] + out["Anpassung"]
         return out
 
-    # Drawing
     def redraw(self) -> None:
         import math
 
@@ -564,56 +500,34 @@ class EODPlotTab(ttk.Frame):
             return
 
         enabled = self._enabled_vars()
+        if not enabled:
+            self.info_var.set("No metric selected.")
+            return
 
-        # Downsample days to keep canvas fast
         max_days = 240
         if len(df) > max_days:
-            idx = pd.Series(range(len(df)))
-            pick = (idx * (len(df) - 1) // (max_days - 1)).drop_duplicates().astype(int).tolist()
+            pick = np.linspace(0, len(df) - 1, num=max_days, dtype=int)
+            pick = pd.unique(pick).tolist()
             df = df.iloc[pick].reset_index(drop=True)
 
-        # Working frame with derived PnL guaranteed
-        df_work = df.copy()
-        if self.PNL_NAME not in df_work.columns:
-            if "Total" in df_work.columns and "Anpassung" in df_work.columns:
-                df_work[self.PNL_NAME] = (
-                    pd.to_numeric(df_work["Total"], errors="coerce").fillna(0.0)
-                    + pd.to_numeric(df_work["Anpassung"], errors="coerce").fillna(0.0)
-                )
-            else:
-                df_work[self.PNL_NAME] = 0.0
-
-        days = df_work["date"].astype(str).tolist()
+        days = df["date"].astype(str).tolist()
         n = len(days)
 
-        # Build daily series and cumulatives
+        level_vals: Dict[str, List[float]] = {}
         daily_vals: Dict[str, List[float]] = {}
-        cum_vals: Dict[str, List[float]] = {}
-
         for v in enabled:
-            if v not in df_work.columns:
-                daily_vals[v] = [0.0] * len(df_work)
-            else:
-                daily_vals[v] = pd.to_numeric(df_work[v], errors="coerce").fillna(0.0).astype(float).tolist()
+            level_vals[v] = pd.to_numeric(df.get(v, 0.0), errors="coerce").fillna(0.0).astype(float).tolist()
+            daily_vals[v] = pd.to_numeric(df.get(f"{v}Daily", 0.0), errors="coerce").fillna(0.0).astype(float).tolist()
 
-            s = 0.0
-            cv = []
-            for x in daily_vals[v]:
-                s += float(x)
-                cv.append(s)
-            cum_vals[v] = cv
-
-        # Canvas size
         w = max(1, c.winfo_width())
         h = max(1, c.winfo_height())
 
-        # Determine scales
-        all_cum = [v for k in enabled for v in cum_vals[k]]
-        all_daily = [v for k in enabled for v in daily_vals[k]]
-        vmax = max(1e-9, max(abs(v) for v in all_cum)) if all_cum else 1.0
+        all_levels = [x for k in enabled for x in level_vals[k]]
+        all_daily = [x for k in enabled for x in daily_vals[k]]
+
+        vmax = max(1e-9, max(abs(v) for v in all_levels)) if all_levels else 1.0
         vmaxb = max(1e-9, max(abs(v) for v in all_daily)) if all_daily else 1.0
 
-        # Dynamic left padding for big Y labels (prevents clipping)
         max_label = max(vmax, vmaxb)
         digits = int(math.log10(max_label)) + 1 if max_label >= 1 else 1
         pad_l = max(54, 18 + digits * 9)
@@ -633,7 +547,6 @@ class EODPlotTab(ttk.Frame):
             self.info_var.set("Canvas too small.")
             return
 
-        # Frames
         c.create_rectangle(x0, y0_top, x1, y1_top, outline="#DDE3F0")
         c.create_rectangle(x0, y0_bot, x1, y1_bot, outline="#DDE3F0")
 
@@ -651,12 +564,11 @@ class EODPlotTab(ttk.Frame):
         def y_bot(v: float) -> float:
             return mid_bot - (v / vmaxb) * (y1_bot - y0_bot) * 0.45
 
-        # Helpers: nice ticks + y axis
         def nice_step(v: float) -> float:
             if v <= 0:
                 return 1.0
             exp = math.floor(math.log10(v))
-            f = v / (10**exp)
+            f = v / (10 ** exp)
             if f <= 1:
                 nf = 1
             elif f <= 2:
@@ -665,7 +577,7 @@ class EODPlotTab(ttk.Frame):
                 nf = 5
             else:
                 nf = 10
-            return nf * (10**exp)
+            return nf * (10 ** exp)
 
         def draw_y_axis(x_axis: float, y_top_px: float, y_bot_px: float, vmax_abs: float, map_y):
             c.create_line(x_axis, y_top_px, x_axis, y_bot_px, fill="#E5E7EB")
@@ -680,58 +592,40 @@ class EODPlotTab(ttk.Frame):
                 y = map_y(t)
                 c.create_line(x_axis - 5, y, x_axis, y, fill="#E5E7EB")
                 c.create_text(
-                    x_axis - 8,
-                    y,
-                    text=f"{t:,.0f}",
-                    anchor="e",
-                    fill="#6B7280",
-                    font=("TkDefaultFont", 8),
+                    x_axis - 8, y, text=f"{t:,.0f}", anchor="e", fill="#6B7280", font=("TkDefaultFont", 8)
                 )
 
         draw_y_axis(x0, y0_top, y1_top, vmax, y_top)
         draw_y_axis(x0, y0_bot, y1_bot, vmaxb, y_bot)
 
-        # Zero lines (highlighted)
         c.create_line(x0, mid_top, x1, mid_top, fill="#CBD5E1", width=2)
         c.create_line(x0, mid_bot, x1, mid_bot, fill="#CBD5E1", width=2)
 
-        # Colors (CEO style)
-        color_map = {
-            "PremiaCum": "#4A6CF7",         # blue
-            "PnLVonDeltaCum": "#111827",    # near black
-            "feesCum": "#F97316",           # orange
-            "Total": "#7C3AED",             # purple
-            "Anpassung": "#10B981",         # green
-            self.PNL_NAME: "#0EA5E9",       # cyan
-        }
-
-        # TOP: cumulative lines
+        # Top cumulative levels
         for v in enabled:
             pts: List[float] = []
-            series = cum_vals[v]
+            series = level_vals[v]
             for i in range(n):
                 pts.extend([x_at(i), y_top(series[i])])
             if len(pts) >= 4:
-                c.create_line(*pts, fill=color_map.get(v, "#111827"), width=2)
+                c.create_line(*pts, fill=self.COLOR_MAP.get(v, "#111827"), width=2)
 
         # Right-side final values
         y_text = y0_top + 10
-        c.create_text(
-            x1 - 6, y0_top - 2, text="Final (cum)", anchor="ne", fill="#6B7280", font=("TkDefaultFont", 9)
-        )
+        c.create_text(x1 - 6, y0_top - 2, text="Final (EOD)", anchor="ne", fill="#6B7280", font=("TkDefaultFont", 9))
         for v in enabled:
-            final = cum_vals[v][-1] if cum_vals[v] else 0.0
+            final = level_vals[v][-1] if level_vals[v] else 0.0
             c.create_text(
                 x1 - 6,
                 y_text,
                 text=f"{v}: {final:,.2f}",
                 anchor="ne",
-                fill=color_map.get(v, "#111827"),
+                fill=self.COLOR_MAP.get(v, "#111827"),
                 font=("TkDefaultFont", 9, "bold"),
             )
             y_text += 16
 
-        # BOTTOM: per-day grouped bars (green/red by sign)
+        # Bottom daily bars
         group_w = slot * 0.80
         k = len(enabled)
         bar_w = max(1.0, group_w / (k + 1.0))
@@ -763,30 +657,25 @@ class EODPlotTab(ttk.Frame):
                         "date": days[i],
                         "var": v,
                         "value": float(val),
-                        "cum": float(cum_vals[v][i]),
+                        "level": float(level_vals[v][i]),
                     }
                 )
 
-        # X ticks
         step = max(1, n // 8)
         for i in range(0, n, step):
-            c.create_text(
-                x_at(i), h - pad_b + 8, text=days[i], fill="#6B7280", font=("TkDefaultFont", 8), anchor="n"
-            )
+            c.create_text(x_at(i), h - pad_b + 8, text=days[i], fill="#6B7280", font=("TkDefaultFont", 8), anchor="n")
 
-        # Titles
         c.create_text(
-            x0, y0_top - 2, text="Cumulative lines (daily cumsum)", anchor="nw",
+            x0, y0_top - 2, text="EOD cumulative levels", anchor="nw",
             fill="#111827", font=("TkDefaultFont", 10, "bold")
         )
         c.create_text(
-            x0, y0_bot - 2, text="Daily bars (green pos / red neg)", anchor="nw",
+            x0, y0_bot - 2, text="Daily changes from EOD levels", anchor="nw",
             fill="#111827", font=("TkDefaultFont", 10, "bold")
         )
 
         self.info_var.set(f"{len(days)} days | vars: {', '.join(enabled)}")
 
-    # Hover tooltip
     def _on_motion(self, event) -> None:
         x, y = event.x, event.y
         hit = None
@@ -802,9 +691,9 @@ class EODPlotTab(ttk.Frame):
         date_s = str(hit["date"])
         var = str(hit["var"])
         val = float(hit["value"])
-        cum = float(hit["cum"])
+        level = float(hit["level"])
 
-        txt = f"{date_s}\n{var}: {val:,.2f}\n{var} (cum): {cum:,.2f}"
+        txt = f"{date_s}\n{var} daily: {val:,.2f}\n{var} EOD: {level:,.2f}"
         self._show_tooltip(event.x_root + 12, event.y_root + 12, txt)
 
     def _show_tooltip(self, x: int, y: int, text: str) -> None:
