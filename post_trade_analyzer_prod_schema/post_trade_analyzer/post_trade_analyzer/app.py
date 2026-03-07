@@ -18,6 +18,9 @@ from .sheets.raw_data import RawDataSheet
 from .sheets.end_of_day import EndOfDaySheet
 from .sheets.instrument_day import InstrumentDaySheet
 from .sheets.day_report import DayReportSheet
+from .sheets.premia_matrix_sheet import PremiaMatrixSheet
+from .sheets.quantity_matrix import QuantityBucketMatrixSheet
+from .sheets.premia_cp import PremiaCPSheet
 
 
 class PostTradeApp(tk.Tk):
@@ -53,11 +56,18 @@ class PostTradeApp(tk.Tk):
         eod = EndOfDaySheet(self.content)
         instday = InstrumentDaySheet(self.content)
         dayrep = DayReportSheet(self.content)
+        premia = PremiaMatrixSheet(self.content)
+        qty_bucket = QuantityBucketMatrixSheet(self.content)
+        premia_cp = PremiaCPSheet(self.content)
+        
 
         self.sheets[raw.sheet_id] = raw
         self.sheets[eod.sheet_id] = eod
         self.sheets[instday.sheet_id] = instday
         self.sheets[dayrep.sheet_id] = dayrep
+        self.sheets[premia.sheet_id] = premia
+        self.sheets[qty_bucket.sheet_id] = qty_bucket
+        self.sheets[premia_cp.sheet_id] = premia_cp
 
         self.nav.set_sheets(list(self.sheets.values()))
         for s in self.sheets.values():
