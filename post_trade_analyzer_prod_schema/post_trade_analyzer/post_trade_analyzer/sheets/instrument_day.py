@@ -12,18 +12,12 @@ from ..utils.table_utils import build_display_cache
 from ..utils.time_utils import parse_iso_date, us_open_berlin
 
 
-# ============================================================
-# Smart autocomplete combobox
-#   - display: "UnderlyingName | inst1, inst2 ..."
-#   - real value returned: underlyingName
-#   - ranking: exact prefix > token match > contains
-# ============================================================
-
 class SmartFilterCombobox(ttk.Combobox):
     SEP = " | "
 
-    def __init__(self, master, *, max_results: int = 25, **kwargs):
+    def __init__(self, master, *, max_results: int = 625, **kwargs):
         super().__init__(master, **kwargs)
+
         self._max_results = max_results
         self._pairs: List[Tuple[str, str]] = []
         self._display_to_real: Dict[str, str] = {}
@@ -33,7 +27,9 @@ class SmartFilterCombobox(ttk.Combobox):
         self.bind("<KeyRelease>", self._on_keyrelease)
         self.bind("<FocusOut>", self._on_focus_out)
         self.bind("<<ComboboxSelected>>", self._on_selected)
-        self.bind("<Button-1>", self._on_click)
+
+        # Mucho más fiable que <Button-1> para preparar el dropdown
+        self.configure(postcommand=self._prepare_dropdown)
 
     def set_pairs(self, pairs: Sequence[Tuple[str, str]]) -> None:
         clean_pairs: List[Tuple[str, str]] = []
@@ -50,7 +46,7 @@ class SmartFilterCombobox(ttk.Combobox):
         self._pairs = clean_pairs
         self._display_to_real = {d: r for d, r in clean_pairs}
         self._all_displays = [d for d, _ in clean_pairs]
-        self["values"] = self._all_displays[: self._max_results]
+        self["values"] = self._all_displays
 
     def get_real_value(self) -> str:
         raw = self.get().strip()
@@ -64,8 +60,9 @@ class SmartFilterCombobox(ttk.Combobox):
 
     def _filtered_displays(self, text: str) -> List[str]:
         t = (text or "").strip().lower()
+
         if not t:
-            return self._all_displays[: self._max_results]
+            return self._all_displays
 
         starts = []
         contains = []
@@ -88,7 +85,12 @@ class SmartFilterCombobox(ttk.Combobox):
             return
 
         current_text = self.get()
-        cursor_pos = self.index(tk.INSERT)
+
+        try:
+            cursor_pos = self.index(tk.INSERT)
+        except Exception:
+            cursor_pos = len(current_text)
+
         vals = self._filtered_displays(current_text)
 
         self._is_updating = True
@@ -104,12 +106,13 @@ class SmartFilterCombobox(ttk.Combobox):
             self._is_updating = False
 
     def _on_focus_out(self, event) -> None:
-        self["values"] = self._all_displays[: self._max_results]
+        pass
 
     def _on_selected(self, event) -> None:
-        self["values"] = self._all_displays[: self._max_results]
+        pass
 
-    def _on_click(self, event) -> None:
+    def _prepare_dropdown(self) -> None:
+        # Justo antes de abrir el dropdown, mostramos los resultados filtrados
         self["values"] = self._filtered_displays(self.get())
 
 
