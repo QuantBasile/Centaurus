@@ -21,6 +21,7 @@ from .sheets.day_report import DayReportSheet
 from .sheets.premia_matrix_sheet import PremiaMatrixSheet
 from .sheets.quantity_matrix import QuantityBucketMatrixSheet
 from .sheets.premia_cp import PremiaCPSheet
+from .sheets.underlying_report import UnderlyingReportSheet
 
 
 class PostTradeApp(tk.Tk):
@@ -59,6 +60,7 @@ class PostTradeApp(tk.Tk):
         premia = PremiaMatrixSheet(self.content)
         qty_bucket = QuantityBucketMatrixSheet(self.content)
         premia_cp = PremiaCPSheet(self.content)
+        und_report = UnderlyingReportSheet(self.content)
         
 
         self.sheets[raw.sheet_id] = raw
@@ -68,6 +70,7 @@ class PostTradeApp(tk.Tk):
         self.sheets[premia.sheet_id] = premia
         self.sheets[qty_bucket.sheet_id] = qty_bucket
         self.sheets[premia_cp.sheet_id] = premia_cp
+        self.sheets[und_report.sheet_id] = und_report
 
         self.nav.set_sheets(list(self.sheets.values()))
         for s in self.sheets.values():

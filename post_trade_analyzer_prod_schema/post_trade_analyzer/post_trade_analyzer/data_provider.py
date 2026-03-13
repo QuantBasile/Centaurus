@@ -110,7 +110,7 @@ class FakeTradeDataProvider:
         spot = base_seed + noise
 
         strike = (np.round(spot / 50.0) * 50.0).astype(np.float64)
-        quantity = ((rs * 37 + 11) % 200 + 1).astype(np.float64)
+        quantity = ((rs * 37 + 11) + 1).astype(np.float64)
         trade_price = np.maximum(0.5, np.abs(spot - strike) / 100.0 + ((rs % 100) / 200.0)).astype(np.float64)
 
         trader_nr = ((rs * 17 + 3) % self.config.n_traders + 1).astype(np.int64)

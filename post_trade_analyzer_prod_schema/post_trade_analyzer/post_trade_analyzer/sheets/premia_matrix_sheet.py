@@ -312,8 +312,17 @@ class PremiaMatrixSheet(ttk.Frame):
         result = result[[self.UNDERLYING_COL] + cp_cols + info_cols]
 
         total_row = {self.UNDERLYING_COL: self.GRAND_TOTAL_LABEL}
-        for col in cp_cols:
-            total_row[col] = float(result[col].sum()) if col in result.columns else 0.0
+        if self._normalize_by_trades.get():
+            for col in cp_cols:
+                mask = bucket[self.COUNTERPARTY_COL] == col
+                pnl = bucket.loc[mask, "selected_sum"].sum()
+                trades = bucket.loc[mask, "trade_count"].sum()
+                total_row[col] = pnl / trades if trades != 0 else 0.0
+        else:
+            for col in cp_cols:
+                total_row[col] = float(result[col].sum()) if col in result.columns else 0.0
+            
+            
         total_row[self.TOTAL_COL] = float(result[self.TOTAL_COL].sum()) if self.TOTAL_COL in result.columns else 0.0
         total_row[self.TOTAL_PREMIA_COL] = float(self._underlying_totals_df[self.TOTAL_PREMIA_COL].sum())
         total_row[self.TOTAL_FEES_COL] = float(self._underlying_totals_df[self.TOTAL_FEES_COL].sum())

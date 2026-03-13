@@ -48,6 +48,8 @@ class PremiaCPSheet(BaseSheet):
         self.kpi_best_ul = tk.StringVar(value="-")
         self.kpi_worst_ul = tk.StringVar(value="-")
         self.kpi_active_uls = tk.StringVar(value="0")
+        self.kpi_total_premia = tk.StringVar(value="0.00")
+        self.kpi_total_fees = tk.StringVar(value="0.00")
 
         self._tooltip: Optional[tk.Toplevel] = None
         self._tooltip_label: Optional[tk.Label] = None
@@ -87,6 +89,8 @@ class PremiaCPSheet(BaseSheet):
         kpi_wrap.pack(fill="x", pady=(0, 10))
 
         self._create_kpi_card(kpi_wrap, "Total PnL", self.kpi_total_pnl).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._create_kpi_card(kpi_wrap, "Total Premia", self.kpi_total_premia).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._create_kpi_card(kpi_wrap, "Total Fees", self.kpi_total_fees).pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._create_kpi_card(kpi_wrap, "Trades", self.kpi_trades).pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._create_kpi_card(kpi_wrap, "PnL / Trade", self.kpi_pnl_trade).pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._create_kpi_card(kpi_wrap, "Best Underlying", self.kpi_best_ul).pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -124,17 +128,20 @@ class PremiaCPSheet(BaseSheet):
             style="Futur.Treeview",
             show="headings",
             selectmode="browse",
-            columns=("underlyingName", "PnL", "Trades", "PnL_per_trade"),
+            columns=("underlyingName", "PnL", "Fees", "Trades", "PnL_per_trade"),
         )
         self.tree.heading("underlyingName", text="underlyingName", command=lambda: self._sort_table("underlyingName"))
         self.tree.heading("PnL", text="PnL", command=lambda: self._sort_table("PnL"))
         self.tree.heading("Trades", text="Trades", command=lambda: self._sort_table("Trades"))
         self.tree.heading("PnL_per_trade", text="PnL/Trade", command=lambda: self._sort_table("PnL_per_trade"))
+        self.tree.heading("Fees", text="Fees", command=lambda: self._sort_table("Fees"))
 
         self.tree.column("underlyingName", width=170, minwidth=120, anchor="w", stretch=True)
         self.tree.column("PnL", width=95, minwidth=80, anchor="e", stretch=False)
+        self.tree.column("Fees", width=95, minwidth=80, anchor="e", stretch=False)
         self.tree.column("Trades", width=80, minwidth=70, anchor="e", stretch=False)
         self.tree.column("PnL_per_trade", width=95, minwidth=80, anchor="e", stretch=False)
+        
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -265,7 +272,7 @@ class PremiaCPSheet(BaseSheet):
 
         if df.empty:
             self._filtered_df = df.copy()
-            self._table_df = pd.DataFrame(columns=["underlyingName", "PnL", "Trades", "PnL_per_trade"])
+            self._table_df = pd.DataFrame(columns=["underlyingName", "PnL", "Premia", "Fees", "Trades", "PnL_per_trade"])
             self._update_kpis_empty()
             self._render_table()
             self._render_chart()
@@ -289,6 +296,8 @@ class PremiaCPSheet(BaseSheet):
             work.groupby("underlyingName", dropna=False)
             .agg(
                 PnL=("pnl", "sum"),
+                Premia=("Premia", "sum"),
+                Fees=("fees", "sum"),
                 Trades=("pnl", "size"),
             )
             .reset_index()
@@ -316,6 +325,8 @@ class PremiaCPSheet(BaseSheet):
         table = self._table_df
 
         total_pnl = float(df["pnl"].sum())
+        total_premia = float(df["Premia"].sum())
+        total_fees = float(df["fees"].sum())
         trades = int(len(df))
         pnl_trade = total_pnl / trades if trades else 0.0
         active_uls = int(df["underlyingName"].nunique())
@@ -325,6 +336,8 @@ class PremiaCPSheet(BaseSheet):
         worst_ul = str(sorted_table.iloc[-1]["underlyingName"]) if len(sorted_table) else "-"
 
         self.kpi_total_pnl.set(_fmt_float(total_pnl))
+        self.kpi_total_premia.set(_fmt_float(total_premia))
+        self.kpi_total_fees.set(_fmt_float(total_fees))
         self.kpi_trades.set(_fmt_int(trades))
         self.kpi_pnl_trade.set(_fmt_float(pnl_trade))
         self.kpi_best_ul.set(best_ul if best_ul else "-")
@@ -333,6 +346,8 @@ class PremiaCPSheet(BaseSheet):
 
     def _update_kpis_empty(self) -> None:
         self.kpi_total_pnl.set("0.00")
+        self.kpi_total_premia.set("0.00")
+        self.kpi_total_fees.set("0.00")
         self.kpi_trades.set("0")
         self.kpi_pnl_trade.set("0.00")
         self.kpi_best_ul.set("-")
@@ -341,7 +356,7 @@ class PremiaCPSheet(BaseSheet):
 
     def _set_empty_state(self) -> None:
         self._filtered_df = None
-        self._table_df = pd.DataFrame(columns=["underlyingName", "PnL", "Trades", "PnL_per_trade"])
+        self._table_df = pd.DataFrame(columns=["underlyingName", "PnL", "Premia", "Fees", "Trades", "PnL_per_trade"])
         self._update_kpis_empty()
         self._render_table()
         self._render_chart()
@@ -382,6 +397,7 @@ class PremiaCPSheet(BaseSheet):
                 values=(
                     row["underlyingName"],
                     _fmt_float(row["PnL"]),
+                    _fmt_float(row["Fees"]),
                     _fmt_int(row["Trades"]),
                     _fmt_float(row["PnL_per_trade"]),
                 ),
